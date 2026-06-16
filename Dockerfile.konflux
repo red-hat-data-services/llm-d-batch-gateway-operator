@@ -2,8 +2,6 @@ FROM registry.access.redhat.com/ubi9/go-toolset:1.25.8@sha256:75ecb48dfaec6655bd
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG CGO_ENABLED=1
-#   BUILD_TYPE=CI for hermetic konflux build (downstream)
-ARG BUILD_TYPE
 
 WORKDIR /opt/app-root/src
 
@@ -19,15 +17,8 @@ RUN mkdir -p bin && \
     GOEXPERIMENT=strictfipsruntime \
     go build -a -o bin/manager ./cmd/
 
-# Obtain the batch-gateway Helm chart into /tmp/batch-gateway-chart.
-COPY Makefile ./
-RUN if [ "${BUILD_TYPE}" = "CI" ]; then \
-        # hermetic: chart provided by the Konflux prefetch step (path set by the downstream prefetch config).
-        cp -r /cachi2/prefetched-charts/batch-gateway /tmp/batch-gateway-chart; \
-    else \
-        make fetch-batch-gateway && \
-        cp -r batch-gateway/charts/batch-gateway /tmp/batch-gateway-chart; \
-    fi
+# Obtain the batch-gateway Helm chart (vendored in the repo by make sync-prefetched-charts).
+COPY prefetched-charts/batch-gateway /tmp/batch-gateway-chart
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:907b68736aa798b2d38255b7aa070b2a70acb90803864a40f05d0ec47556ddd0
 WORKDIR /
