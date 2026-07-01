@@ -26,6 +26,7 @@ param_image() { grep -E "^$1=" "${PARAMS_ENV}" 2>/dev/null | head -n1 | cut -d= 
 APISERVER_IMG="${APISERVER_IMG:-$(param_image LLM_D_BATCH_GATEWAY_APISERVER_IMAGE)}"
 PROCESSOR_IMG="${PROCESSOR_IMG:-$(param_image LLM_D_BATCH_GATEWAY_PROCESSOR_IMAGE)}"
 GC_IMG="${GC_IMG:-$(param_image LLM_D_BATCH_GATEWAY_GC_IMAGE)}"
+ASYNC_IMG="${ASYNC_IMG:-$(param_image LLM_D_ASYNC_IMAGE)}"
 VLLM_SIM_IMG="${VLLM_SIM_IMG:-ghcr.io/llm-d/llm-d-inference-sim:latest}"
 
 # Port configuration (matches batch-gateway defaults)
@@ -248,7 +249,8 @@ deploy_operator() {
     kubectl set env deployment/llm-d-batch-gateway-operator -n "${OPERATOR_NAMESPACE}" \
         LLM_D_BATCH_GATEWAY_APISERVER_IMAGE="${APISERVER_IMG}" \
         LLM_D_BATCH_GATEWAY_PROCESSOR_IMAGE="${PROCESSOR_IMG}" \
-        LLM_D_BATCH_GATEWAY_GC_IMAGE="${GC_IMG}"
+        LLM_D_BATCH_GATEWAY_GC_IMAGE="${GC_IMG}" \
+        LLM_D_ASYNC_IMAGE="${ASYNC_IMG}"
 
     kubectl rollout status deployment/llm-d-batch-gateway-operator \
         -n "${OPERATOR_NAMESPACE}" --timeout=120s

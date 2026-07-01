@@ -32,6 +32,7 @@ type ComponentImages struct {
 	APIServer string
 	Processor string
 	GC        string
+	Async     string
 }
 
 type HelmRenderer struct {

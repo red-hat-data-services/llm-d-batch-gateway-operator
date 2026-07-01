@@ -29,39 +29,41 @@ import (
 // It defaults to "dev" when built without the flag (e.g. go run).
 var version = "dev"
 
-// the way for batch-gateway-operator to know which exactly are the 3 component images(disgest) are via env variable set in the deployment
+// the way for batch-gateway-operator to know which exactly are the 4 component images(disgest) are via env variable set in the deployment
 // since it cannot read params.env which is updated by opendatahub-operator
 const (
 	envImageAPIServer = "LLM_D_BATCH_GATEWAY_APISERVER_IMAGE"
 	envImageProcessor = "LLM_D_BATCH_GATEWAY_PROCESSOR_IMAGE"
 	envImageGC        = "LLM_D_BATCH_GATEWAY_GC_IMAGE"
+	envImageAsync     = "LLM_D_ASYNC_IMAGE"
 )
 
 // componentImagesFromEnv reads the pinned component images from the environment
 // and fails if any are missing, since the operator cannot render workloads
 // without them.
 func componentImagesFromEnv() (controller.ComponentImages, error) {
-	images := controller.ComponentImages{
-		APIServer: os.Getenv(envImageAPIServer),
-		Processor: os.Getenv(envImageProcessor),
-		GC:        os.Getenv(envImageGC),
+	required := []string{
+		envImageAPIServer,
+		envImageProcessor,
+		envImageGC,
+		envImageAsync,
 	}
-
 	var missing []string
-	if images.APIServer == "" {
-		missing = append(missing, envImageAPIServer)
-	}
-	if images.Processor == "" {
-		missing = append(missing, envImageProcessor)
-	}
-	if images.GC == "" {
-		missing = append(missing, envImageGC)
+	for _, e := range required {
+		if os.Getenv(e) == "" {
+			missing = append(missing, e)
+		}
 	}
 	if len(missing) > 0 {
 		return controller.ComponentImages{}, fmt.Errorf("required image environment variables are not set: %s", strings.Join(missing, ", "))
 	}
 
-	return images, nil
+	return controller.ComponentImages{
+		APIServer: os.Getenv(envImageAPIServer),
+		Processor: os.Getenv(envImageProcessor),
+		GC:        os.Getenv(envImageGC),
+		Async:     os.Getenv(envImageAsync),
+	}, nil
 }
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;create;update;patch
