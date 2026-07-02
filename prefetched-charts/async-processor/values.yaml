@@ -1,0 +1,205 @@
+ap:
+  # Inference gateway base URL (REQUIRED for single-queue / single-topic mode).
+  # Results are dispatched here; an empty or wrong value silently consumes
+  # requests without producing results, so it is validated at install time.
+  # For multi-queue/multi-topic setups, set per-entry igw_base_url in
+  # redis.queuesConfig / gcpPubSub.topicsConfig instead of this global value.
+  igwBaseURL: ""
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  image:
+    repository: ghcr.io/llm-d-incubation/llm-d-async
+    # Image tag. Leave empty to track the chart's appVersion (recommended so the
+    # image stays in sync with the chart). Set explicitly to pin a different tag.
+    tag: ""
+  imagePullPolicy: Always
+  concurrency: 8
+  drainTimeout: "2m"
+  prometheusURL: ""
+  prometheusCacheTTL: ""
+  # Named worker pools configuration. When specified, overrides the global concurrency option.
+  # workerPools:
+  #   - id: "default"
+  #     workers: 8
+  #   - id: "premium"
+  #     workers: 16
+  workerPools: []
+  # Request body-transform plugins. When set, rendered to a config file and passed
+  # via --transform-config-file. Object with a requestTransforms array; each entry
+  # has a unique name, a registered plugin type, and opaque parameters. Empty
+  # disables transforms (default JSON dispatch is unchanged).
+  # transformConfig:
+  #   requestTransforms:
+  #     - name: "gcs-whisper"
+  #       type: "gcs_uri_multipart"
+  #       parameters:
+  #         providers: ["whisper"]
+  transformConfig: {}
+  otel:
+    # OTLP gRPC endpoint for trace collection. Examples:
+    #   Dev (Jaeger all-in-one):     "http://jaeger.default.svc.cluster.local:4317"
+    #   OpenShift TempoStack:        "http://tempo-distributor.openshift-tempo-operator.svc:4317"
+    #   OpenShift OTEL Collector:    "http://otel-collector.openshift-distributed-tracing.svc:4317"
+    #   Grafana Alloy/Agent:         "http://alloy.monitoring.svc.cluster.local:4317"
+    # Leave empty to disable tracing.
+    endpoint: ""
+    # Use insecure (plaintext) gRPC connection to the collector.
+    insecure: true
+    # Sampling configuration (maps to standard OTel env vars).
+    # Options: "always_on", "always_off", "traceidratio", "parentbased_traceidratio"
+    # Default is "parentbased_traceidratio" (recommended for production).
+    sampler: "parentbased_traceidratio"
+    # Sampling ratio (0.0 to 1.0), used when sampler is "*traceidratio".
+    # 1.0 = 100% (dev), 0.1 = 10% (production).
+    samplerArg: "1.0"
+    # Enable per-command Redis tracing spans. Can produce high span volume —
+    # leave disabled unless actively debugging Redis.
+    redisTracing: false
+  health:
+    port: 8081
+    livenessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    startupProbe:
+      initialDelaySeconds: 0
+      periodSeconds: 2
+      timeoutSeconds: 3
+      failureThreshold: 30
+  metrics:
+    enabled: true
+    port: 9090
+    secure: false
+  # Message queue implementation. Supported: "redis-sortedset", "redis-pubsub",
+  # "gcp-pubsub", "gcp-pubsub-gated". Leave empty to auto-select: redis-pubsub by
+  # default, and for GCP Pub/Sub "gcp-pubsub-gated" when any gcpPubSub.topicsConfig
+  # entry declares a gate_type (per-topic gates only take effect in gated mode),
+  # otherwise "gcp-pubsub".
+  messageQueueImpl: ""
+  gcpPubSub:
+    enabled: false
+    # GCP project ID for the Pub/Sub client. Required for the gcp-pubsub backends:
+    # the process panics on startup ("projectID string is empty") if unset.
+    projectId: ""
+    requestSubscriberId: ""
+    resultTopicId: ""
+    requestPathURL: "/v1/completions"
+    # Full multi-topic configuration (overrides single-topic fields above).
+    # Each entry supports its own subscriber_id, worker_pool_id, inference_objective,
+    # request_path_url, igw_base_url, gate_type and gate_params.
+    # topicsConfig:
+    #   - subscriber_id: "projects/my-project/subscriptions/sub-1"
+    #     worker_pool_id: "default"
+    #     inference_objective: "latency"
+    #     request_path_url: "/v1/completions"
+    #     igw_base_url: "http://igw:80"
+    #     gate_type: "prometheus-saturation"
+    #     gate_params:
+    #       pool: "pool-1"
+    #       threshold: 0.7
+    topicsConfig: []
+  tls:
+    secretName: ""
+    insecureSkipVerify: false
+    caCertKey: ""
+    certKey: ""
+    keyKey: ""
+  redis:
+    enabled: false
+    # Option 1: provide the URL directly — chart creates the Secret automatically.
+    # WARNING: Helm values are retrievable via `helm get values` and may expose credentials.
+    # For production or credentialed URLs, prefer Option 2 (secretName/secretKey).
+    # url: "redis://redis-master.redis.svc.cluster.local:6379"
+    # Option 2: reference a pre-existing Secret (used when url is not set).
+    # Empty by default so an unconfigured Redis connection fails fast at install
+    # time instead of referencing a Secret that may not exist.
+    secretName: ""
+    secretKey: "url"
+    requestPathURL: "/v1/completions"
+    # For redis-sortedset
+    requestQueueName: "request-sortedset"
+    resultQueueName: "result-list"
+    pollIntervalMs: 1000
+    batchSize: 10
+    gateType: ""
+    gateParams: {}
+    # Full multi-queue configuration (overrides single-queue fields above).
+    # For redis-sortedset, each entry supports its own gate_type and gate_params.
+    # For redis-pubsub, only queue_name, inference_objective, request_path_url, igw_base_url are used.
+    # queuesConfig:
+    #   - queue_name: "queue-1"
+    #     inference_objective: ""
+    #     request_path_url: "/v1/completions"
+    #     igw_base_url: "http://igw:80"
+    #     gate_type: "prometheus-saturation"
+    #     gate_params:
+    #       pool: "pool-1"
+    #       threshold: 0.7
+    #   - queue_name: "queue-2"
+    #     request_path_url: "/v1/completions"
+    #     igw_base_url: "http://igw:80"
+    #     gate_type: "redis-quota"
+    #     gate_params:
+    #       address: "redis:6379"
+    #       limit: "5"
+    queuesConfig: []
+  # PodMonitor for async-processor metrics scraping.
+  podMonitor:
+    enabled: false
+    interval: "30s"
+    labels: {}
+  prometheusRule:
+    enabled: false
+    labels: {}
+    rules:
+      highRetryRate:
+        enabled: true
+        threshold: 0.5
+        for: "15m"
+      highDeadlineExceededRate:
+        enabled: true
+        threshold: 0.1
+        for: "10m"
+      lowSuccessRate:
+        enabled: true
+        threshold: 0.9
+        for: "10m"
+      highShedRate:
+        enabled: true
+        threshold: 0.1
+        for: "10m"
+  grafana:
+    dashboards:
+      enabled: false
+      label: grafana_dashboard
+      labelValue: "1"
+  # PodMonitor for model server metrics relabeling.
+  # Creates a PodMonitor that scrapes vLLM metrics and relabels
+  # the inference_pool pod label into scraped metrics.
+  # Required when using prometheus-budget or prometheus-saturation gates
+  # without llm-d's flow control plugin enabled.
+  modelServerMonitor:
+    enabled: false
+    selector:
+      llm-d.ai/role: decode
+    port: modelserver
+    path: /metrics
+    interval: 15s
