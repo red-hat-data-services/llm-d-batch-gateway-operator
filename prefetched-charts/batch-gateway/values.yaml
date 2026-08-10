@@ -101,9 +101,9 @@ apiserver:
   terminationGracePeriodSeconds: 120
 
   image:
-    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
+    repository: ghcr.io/llm-d/batch-gateway-apiserver
     pullPolicy: Always
-    tag: "odh-stable"
+    tag: "latest"
     digest: ""
 
   nameOverride: ""
@@ -215,6 +215,10 @@ apiserver:
       issuerName: ""
       issuerKind: ClusterIssuer
       dnsNames: []
+    # TLS security profile configuration (injected by operators)
+    minVersion: ""          # Minimum TLS version (VersionTLS12, VersionTLS13)
+    cipherSuites: ""        # Comma-separated list of TLS cipher suites
+    nextProtos: ""          # Comma-separated list of ALPN protocols (default: h2,http/1.1)
 
   # ServiceMonitor for Prometheus Operator auto-discovery.
   # Scrapes the observability port (default 8081) where /metrics is served.
@@ -239,9 +243,9 @@ processor:
     medium: "" # node disk
 
   image:
-    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-processor
+    repository: ghcr.io/llm-d/batch-gateway-processor
     pullPolicy: Always
-    tag: "odh-stable"
+    tag: "latest"
     digest: ""
 
   nameOverride: ""
@@ -457,9 +461,9 @@ gc:
   replicaCount: 1
 
   image:
-    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-gc
+    repository: ghcr.io/llm-d/batch-gateway-gc
     pullPolicy: IfNotPresent
-    tag: "odh-stable"
+    tag: "latest"
     digest: ""
 
   serviceAccount:
