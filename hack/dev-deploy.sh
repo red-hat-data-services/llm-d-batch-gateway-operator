@@ -14,11 +14,12 @@ OPERATOR_IMG="${OPERATOR_IMG:-localhost/llm-d-batch-gateway-operator:dev}"
 
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-}"
 PROMETHEUS_OPERATOR_VERSION="${PROMETHEUS_OPERATOR_VERSION:-}"
+SEAWEEDFS_RELEASE="${SEAWEEDFS_RELEASE:-seaweedfs}"
 
 # Dev profile selects which config/samples/dev-<profile>.yaml CR to apply.
-# Available: sync (default), async, async-gate-redis, async-gate-prometheus-query,
+# Available: async (default), sync, async-gate-redis, async-gate-prometheus-query,
 #            async-gate-prometheus-budget, async-gate-endpoint-scrape.
-DEV_PROFILE="${DEV_PROFILE:-sync}"
+DEV_PROFILE="${DEV_PROFILE:-async}"
 
 # read from params.env if you wanna test a different image, go update params.env
 PARAMS_ENV="${OPERATOR_DIR}/config/base/params.env"
@@ -28,6 +29,15 @@ PROCESSOR_IMG="${PROCESSOR_IMG:-$(param_image LLM_D_BATCH_GATEWAY_PROCESSOR_IMAG
 GC_IMG="${GC_IMG:-$(param_image LLM_D_BATCH_GATEWAY_GC_IMAGE)}"
 ASYNC_IMG="${ASYNC_IMG:-$(param_image LLM_D_ASYNC_IMAGE)}"
 VLLM_SIM_IMG="${VLLM_SIM_IMG:-ghcr.io/llm-d/llm-d-inference-sim:latest}"
+
+random_hex() {
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# Generate credentials for this local deployment unless the caller supplies them.
+# setup-prereqs.sh requires both values and applies them to SeaweedFS on every run.
+SEAWEEDFS_ACCESS_KEY="${SEAWEEDFS_ACCESS_KEY:-batch-gateway-$(random_hex)}"
+SEAWEEDFS_SECRET_KEY="${SEAWEEDFS_SECRET_KEY:-$(random_hex)}"
 
 # Port configuration (matches batch-gateway defaults)
 APISERVER_NODE_PORT="${APISERVER_NODE_PORT:-30080}"
@@ -154,8 +164,16 @@ detect_file_storage_type() {
 }
 
 install_prereqs() {
+    local install_redis=false
+    if [[ "${DEV_PROFILE}" == async* ]]; then
+        install_redis=true
+    fi
     FILE_CLIENT_TYPE="$(detect_file_storage_type)" \
-        NAMESPACE="${NAMESPACE}" bash "${SCRIPT_DIR}/setup-prereqs.sh"
+        INSTALL_REDIS="${install_redis}" \
+        NAMESPACE="${NAMESPACE}" \
+        SEAWEEDFS_ACCESS_KEY="${SEAWEEDFS_ACCESS_KEY}" \
+        SEAWEEDFS_SECRET_KEY="${SEAWEEDFS_SECRET_KEY}" \
+        bash "${SCRIPT_DIR}/setup-prereqs.sh"
 }
 
 install_gateway_api_crds() {
@@ -444,6 +462,19 @@ deploy_operator() {
 
 # ── Wait & Verify ────────────────────────────────────────────────────────────
 
+# Render the dev CR to stdout. For S3 profiles, point file storage at the SeaweedFS
+# Service that setup-prereqs.sh installs in ${NAMESPACE}, using the generated access key.
+render_dev_cr() {
+    local cr_file="$1"
+    if [[ "$(detect_file_storage_type)" != "s3" ]]; then
+        cat "${cr_file}"
+        return
+    fi
+    SEAWEEDFS_ACCESS_KEY="${SEAWEEDFS_ACCESS_KEY}" \
+        SEAWEEDFS_ENDPOINT="http://${SEAWEEDFS_RELEASE}.${NAMESPACE}.svc.cluster.local:8333" \
+        yq eval '.spec.fileStorage.s3.accessKeyId = strenv(SEAWEEDFS_ACCESS_KEY) | .spec.fileStorage.s3.endpoint = strenv(SEAWEEDFS_ENDPOINT)' "${cr_file}"
+}
+
 apply_and_verify_cr() {
     cd "${OPERATOR_DIR}"
 
@@ -454,7 +485,7 @@ apply_and_verify_cr() {
     if [ ! -f "${cr_file}" ]; then
         die "Dev profile CR not found: ${cr_file} (DEV_PROFILE=${DEV_PROFILE})"
     fi
-    kubectl apply -f "${cr_file}" -n "${NAMESPACE}"
+    render_dev_cr "${cr_file}" | kubectl apply -f - -n "${NAMESPACE}"
 
     local cr_name
     cr_name=$(yq '.metadata.name' "$cr_file")
@@ -659,4 +690,6 @@ main() {
     print_status
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
