@@ -12,6 +12,8 @@ import (
 	tlspkg "github.com/opendatahub-io/llm-d-batch-gateway-operator/internal/tls"
 )
 
+const classifyEndpoint = "/v1/classify"
+
 // testSecretName returns the secret name for use in tests, simulating what
 // resolveSecret returns in the same-namespace case.
 func testSecretName(gw *batchv1alpha1.LLMBatchGateway) string {
@@ -110,7 +112,8 @@ func TestSpecToHelmValues(t *testing.T) {
 			SecretRef: corev1.SecretReference{
 				Name: "my-secret",
 			},
-			DBBackend: "postgresql",
+			DBBackend:      dbBackendPostgreSQL,
+			ExtraEndpoints: []string{classifyEndpoint},
 			FileStorage: &batchv1alpha1.FileStorageSpec{
 				S3: &batchv1alpha1.S3StorageSpec{
 					Region:   "us-east-1",
@@ -159,8 +162,8 @@ func TestSpecToHelmValues(t *testing.T) {
 	t.Run("global db client type", func(t *testing.T) {
 		global := vals["global"].(map[string]interface{})
 		dbClient := global["dbClient"].(map[string]interface{})
-		if got := dbClient["type"]; got != "postgresql" {
-			t.Errorf("dbClient.type = %v, want %q", got, "postgresql")
+		if got := dbClient["type"]; got != dbBackendPostgreSQL {
+			t.Errorf("dbClient.type = %v, want %q", got, dbBackendPostgreSQL)
 		}
 	})
 
@@ -169,6 +172,14 @@ func TestSpecToHelmValues(t *testing.T) {
 		dbClient := global["dbClient"].(map[string]interface{})
 		if _, ok := dbClient["redis"]; ok {
 			t.Error("dbClient.redis should not be present when RedisClient is nil")
+		}
+	})
+
+	t.Run("global extra endpoints", func(t *testing.T) {
+		global := vals["global"].(map[string]interface{})
+		endpoints := global["extraEndpoints"].([]interface{})
+		if len(endpoints) != 1 || endpoints[0] != classifyEndpoint {
+			t.Errorf("global.extraEndpoints = %v, want [/v1/classify]", endpoints)
 		}
 	})
 
@@ -548,8 +559,11 @@ func TestSpecToHelmValues_OTEL(t *testing.T) {
 	if got := otel["sampler"]; got != "parentbased_traceidratio" {
 		t.Errorf("otel.sampler = %v", got)
 	}
-	if got := otel["redisTracing"]; got != true {
-		t.Errorf("otel.redisTracing = %v, want true", got)
+	if _, ok := otel["redisTracing"]; ok {
+		t.Error("otel.redisTracing must not be rendered by the current chart")
+	}
+	if got := otel["postgresqlTracing"]; got != true {
+		t.Errorf("otel.postgresqlTracing = %v, want true", got)
 	}
 }
 
@@ -810,6 +824,7 @@ func TestSpecToHelmValues_APIServerConfig(t *testing.T) {
 		BatchAPI: &batchv1alpha1.BatchAPIConfig{
 			EventTTLSeconds:    3600,
 			PassThroughHeaders: []string{"X-Request-ID", "Authorization"},
+			ExtraEndpoints:     ptr.To([]string{classifyEndpoint}),
 		},
 		FileAPI: &batchv1alpha1.FileAPIConfig{
 			DefaultExpirationSeconds: 86400,
@@ -850,16 +865,23 @@ func TestSpecToHelmValues_APIServerConfig(t *testing.T) {
 	if len(headers) != 2 || headers[0] != "X-Request-ID" {
 		t.Errorf("passThroughHeaders = %v", headers)
 	}
+	if endpoints := batchAPI["extraEndpoints"].([]interface{}); len(endpoints) != 1 || endpoints[0] != classifyEndpoint {
+		t.Errorf("batchAPI.extraEndpoints = %v, want [/v1/classify]", endpoints)
+	}
 
 	fileAPI := config["fileAPI"].(map[string]interface{})
 	if got := fileAPI["defaultExpirationSeconds"]; got != int64(86400) {
 		t.Errorf("fileAPI.defaultExpirationSeconds = %v, want 86400", got)
 	}
-	if got := fileAPI["maxSizeBytes"]; got != int64(104857600) {
-		t.Errorf("fileAPI.maxSizeBytes = %v, want 104857600", got)
+	if _, found := fileAPI["maxSizeBytes"]; found {
+		t.Error("fileAPI.maxSizeBytes should not be rendered by the current chart")
 	}
 	if got := fileAPI["maxLineCount"]; got != int64(100000) {
 		t.Errorf("fileAPI.maxLineCount = %v, want 100000", got)
+	}
+	global := vals["global"].(map[string]interface{})
+	if got := global["maxInputFileSizeBytes"]; got != int64(104857600) {
+		t.Errorf("global.maxInputFileSizeBytes = %v, want 104857600", got)
 	}
 }
 
@@ -873,8 +895,10 @@ func TestSpecToHelmValues_ProcessorConfig(t *testing.T) {
 			PerEndpoint: 16,
 			Recovery:    4,
 		},
+		InputFileDiskBudgetPercent:     20,
+		ExtraEndpoints:                 ptr.To([]string{classifyEndpoint}),
 		DefaultOutputExpirationSeconds: 7200,
-		ProgressTTLSeconds:             3600,
+		ProgressUpdateInterval:         "30s",
 		EnablePprof:                    true,
 	}
 
@@ -909,11 +933,47 @@ func TestSpecToHelmValues_ProcessorConfig(t *testing.T) {
 	if got := config["defaultOutputExpirationSeconds"]; got != int64(7200) {
 		t.Errorf("defaultOutputExpirationSeconds = %v, want 7200", got)
 	}
-	if got := config["progressTTLSeconds"]; got != int64(3600) {
-		t.Errorf("progressTTLSeconds = %v, want 3600", got)
+	if got := config["progressUpdateInterval"]; got != "30s" {
+		t.Errorf("progressUpdateInterval = %v, want 30s", got)
+	}
+	if got := config["inputFileDiskBudgetPercent"]; got != int64(20) {
+		t.Errorf("inputFileDiskBudgetPercent = %v, want 20", got)
+	}
+	if endpoints := config["extraEndpoints"].([]interface{}); len(endpoints) != 1 || endpoints[0] != classifyEndpoint {
+		t.Errorf("processor.extraEndpoints = %v, want [/v1/classify]", endpoints)
 	}
 	if got := config["enablePprof"]; got != true {
 		t.Errorf("enablePprof = %v, want true", got)
+	}
+}
+
+func TestSpecToHelmValues_EmptyExtraEndpointsOverride(t *testing.T) {
+	gateway := minimalGateway()
+	gateway.Spec.ExtraEndpoints = []string{classifyEndpoint}
+	gateway.Spec.APIServer.Config = &batchv1alpha1.APIServerConfigSpec{
+		BatchAPI: &batchv1alpha1.BatchAPIConfig{
+			ExtraEndpoints: ptr.To([]string{}),
+		},
+	}
+	gateway.Spec.Processor.Config = &batchv1alpha1.ProcessorConfigSpec{
+		ExtraEndpoints: ptr.To([]string{}),
+	}
+
+	vals := specToBatchHelmValues(gateway, testSecretName(gateway), testImages(), tlspkg.ProfileValues{})
+
+	apiserver := vals["apiserver"].(map[string]interface{})
+	apiConfig := apiserver["config"].(map[string]interface{})
+	batchAPI := apiConfig["batchAPI"].(map[string]interface{})
+	apiEndpoints, ok := batchAPI["extraEndpoints"].([]interface{})
+	if !ok || len(apiEndpoints) != 0 {
+		t.Errorf("apiserver extraEndpoints = %v, want an explicit empty list", batchAPI["extraEndpoints"])
+	}
+
+	processor := vals["processor"].(map[string]interface{})
+	processorConfig := processor["config"].(map[string]interface{})
+	processorEndpoints, ok := processorConfig["extraEndpoints"].([]interface{})
+	if !ok || len(processorEndpoints) != 0 {
+		t.Errorf("processor extraEndpoints = %v, want an explicit empty list", processorConfig["extraEndpoints"])
 	}
 }
 
@@ -1061,7 +1121,7 @@ func TestSpecToHelmValues_InferenceGatewayMaxRetries(t *testing.T) {
 	}
 }
 
-func TestSpecToHelmValues_RedisTLS(t *testing.T) {
+func TestSpecToHelmValues_CoreRedisSettingsIgnored(t *testing.T) {
 	gw := minimalGateway()
 	gw.Spec.Redis = &batchv1alpha1.RedisClientSpec{
 		EnableTLS: true,
@@ -1072,12 +1132,8 @@ func TestSpecToHelmValues_RedisTLS(t *testing.T) {
 
 	global := vals["global"].(map[string]interface{})
 	dbClient := global["dbClient"].(map[string]interface{})
-	redis := dbClient["redis"].(map[string]interface{})
-	if got := redis["enableTLS"]; got != true {
-		t.Errorf("dbClient.redis.enableTLS = %v, want true", got)
-	}
-	if got := redis["insecure"]; got != true {
-		t.Errorf("dbClient.redis.insecure = %v, want true", got)
+	if _, ok := dbClient["redis"]; ok {
+		t.Error("dbClient.redis must not be rendered by the current chart")
 	}
 }
 
@@ -1356,7 +1412,7 @@ func minimalGateway() *batchv1alpha1.LLMBatchGateway {
 			SecretRef: corev1.SecretReference{
 				Name: "batch-gateway-secrets",
 			},
-			DBBackend: "postgresql",
+			DBBackend: dbBackendPostgreSQL,
 			FileStorage: &batchv1alpha1.FileStorageSpec{
 				S3: &batchv1alpha1.S3StorageSpec{
 					Region:   "us-east-1",

@@ -40,7 +40,8 @@ const (
 	conditionGCAvailable             = "GCAvailable"
 	conditionAsyncProcessorAvailable = "AsyncProcessorAvailable"
 
-	dispatchModeAsync = "async"
+	dispatchModeAsync   = "async"
+	dbBackendPostgreSQL = "postgresql"
 
 	labelKeyComponent       = "app.kubernetes.io/component"
 	labelKeyInstance        = "app.kubernetes.io/instance"
@@ -660,6 +661,12 @@ func conditionReason(ok bool, trueReason, falseReason string) string {
 }
 
 func validateSpec(gw *batchv1alpha1.LLMBatchGateway) error {
+	if gw.Spec.DBBackend != "" && gw.Spec.DBBackend != dbBackendPostgreSQL {
+		return fmt.Errorf("spec.dbBackend %q is not supported; only \"postgresql\" is supported by batch-gateway", gw.Spec.DBBackend)
+	}
+	if gw.Spec.Redis != nil {
+		return errors.New("spec.redis is not supported by batch-gateway; configure Redis under spec.processor.asyncConfig")
+	}
 	hasGlobal := gw.Spec.Processor.GlobalInferenceGateway != nil
 	hasModel := len(gw.Spec.Processor.ModelGateways) > 0
 	if !hasGlobal && !hasModel {
