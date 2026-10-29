@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"slices"
 	"time"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -43,6 +41,7 @@ const (
 	conditionAsyncProcessorAvailable = "AsyncProcessorAvailable"
 
 	dispatchModeAsync        = "async"
+	dispatchModeSync         = "sync"
 	dbBackendPostgreSQL      = "postgresql"
 	gatePrometheusBudget     = "prometheus-budget"
 	gatePrometheusQuery      = "prometheus-query"
@@ -58,10 +57,32 @@ const (
 	conditionsStatusField         = "conditions"
 	componentStatusField          = "componentStatus"
 	observedGenerationStatusField = "observedGeneration"
+	reasonReferenceNotPermitted   = "ReferenceNotPermitted"
+	reasonSecretRefImmutable      = "SecretRefImmutable"
+	reasonValidationFailed        = "ValidationFailed"
+	reasonRenderFailed            = "RenderFailed"
+	reasonAvailable               = "Available"
+	reasonUnavailable             = "Unavailable"
+	reasonReady                   = "AllComponentsReady"
+	reasonNotReady                = "ComponentsNotReady"
+	reasonApplyFailed             = "ApplyFailed"
 
-	reasonReferenceNotPermitted = "ReferenceNotPermitted"
-	reasonSecretRefImmutable    = "SecretRefImmutable"
-	reasonDeprecatedField       = "DeprecatedField"
+	readyMessage    = "All components are fully rolled out"
+	notReadyMessage = "One or more components are not fully rolled out"
+)
+
+// componentCondition binds a component's Available condition type to the name
+// used in its status messages.
+type componentCondition struct {
+	conditionType string
+	name          string
+}
+
+var (
+	apiServerCondition      = componentCondition{conditionType: conditionAPIServerAvailable, name: "API server"}
+	processorCondition      = componentCondition{conditionType: conditionProcessorAvailable, name: "Processor"}
+	gcCondition             = componentCondition{conditionType: conditionGCAvailable, name: "GC"}
+	asyncProcessorCondition = componentCondition{conditionType: conditionAsyncProcessorAvailable, name: "Async processor"}
 )
 
 // managedGVKs must be a superset of all GVK types the Helm chart can produce.
@@ -164,40 +185,12 @@ func (r *LLMBatchGatewayReconciler) reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	if err := validateSpec(&gw); err != nil {
-		gw.Status.ObservedGeneration = gw.Generation
-		condTypes := []string{
-			conditionReady,
-			conditionAPIServerAvailable,
-			conditionProcessorAvailable,
-			conditionGCAvailable,
+		failure := statusFailure{
+			reason:     reasonValidationFailed,
+			message:    fmt.Sprintf("Spec validation failed: %s", err),
+			conditions: allConditionTypes(),
 		}
-		if gw.Spec.Processor.DispatchMode == dispatchModeAsync {
-			condTypes = append(condTypes, conditionAsyncProcessorAvailable)
-		} else {
-			meta.RemoveStatusCondition(&gw.Status.Conditions, conditionAsyncProcessorAvailable)
-		}
-		for _, condType := range condTypes {
-			meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-				Type:               condType,
-				Status:             metav1.ConditionFalse,
-				Reason:             "ValidationFailed",
-				Message:            err.Error(),
-				ObservedGeneration: gw.Generation,
-			})
-		}
-		r.Recorder.Eventf(&gw, corev1.EventTypeWarning, "ValidationFailed", "Spec validation failed: %s", err)
-		if statusErr := NewStatusPatch(gw.ResourceVersion).
-			Add(conditionsStatusField, gw.Status.Conditions).
-			Add(observedGenerationStatusField, gw.Status.ObservedGeneration).
-			Apply(ctx, r.Client, &gw); statusErr != nil {
-			return ctrl.Result{}, fmt.Errorf("patching status after validation failure: %w", statusErr)
-		}
-		return ctrl.Result{}, nil
-	}
-
-	if gw.Spec.Processor.Config != nil && gw.Spec.Processor.Config.InferenceObjective != "" { //nolint:staticcheck // deprecated field is honored on purpose
-		r.Recorder.Event(&gw, corev1.EventTypeWarning, reasonDeprecatedField,
-			"spec.processor.config.inferenceObjective is deprecated; set inferenceObjective on globalInferenceGateway or modelGateways.<model> instead")
+		return ctrl.Result{}, r.recordFailure(ctx, &gw, failure)
 	}
 
 	// Resolve the credentials Secret, copying it into gw.Namespace when it
@@ -213,24 +206,14 @@ func (r *LLMBatchGatewayReconciler) reconcile(ctx context.Context, req ctrl.Requ
 			reason, permanent = reasonSecretRefImmutable, true
 		}
 		if permanent {
-			gw.Status.ObservedGeneration = gw.Generation
-			meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-				Type:               conditionReady,
-				Status:             metav1.ConditionFalse,
-				Reason:             reason,
-				Message:            err.Error(),
-				ObservedGeneration: gw.Generation,
-			})
-			r.Recorder.Eventf(&gw, corev1.EventTypeWarning, reason, "%s", err)
-			if statusErr := NewStatusPatch(gw.ResourceVersion).
-				Add(conditionsStatusField, gw.Status.Conditions).
-				Add(observedGenerationStatusField, gw.Status.ObservedGeneration).
-				Apply(ctx, r.Client, &gw); statusErr != nil {
-				return ctrl.Result{}, fmt.Errorf("patching status after %s: %w", reason, statusErr)
-			}
 			// Permanent error — no requeue. The user must act (create a
 			// ReferenceGrant, or delete+recreate the CR for SecretRefImmutable).
-			return ctrl.Result{}, nil
+			failure := statusFailure{
+				reason:     reason,
+				message:    err.Error(),
+				conditions: []string{conditionReady},
+			}
+			return ctrl.Result{}, r.recordFailure(ctx, &gw, failure)
 		}
 		return ctrl.Result{}, fmt.Errorf("resolving secret: %w", err)
 	}
@@ -245,49 +228,19 @@ func (r *LLMBatchGatewayReconciler) reconcile(ctx context.Context, req ctrl.Requ
 
 	batchObjects, err := r.BatchGWHelmRenderer.RenderBatchChart(&gw, localSecretName)
 	if err != nil {
-		gw.Status.ObservedGeneration = gw.Generation
-		meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-			Type:               conditionReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             "RenderFailed",
-			Message:            err.Error(),
-			ObservedGeneration: gw.Generation,
-		})
-		r.Recorder.Eventf(&gw, corev1.EventTypeWarning, "RenderFailed", "Batch-gateway chart render failed: %s", err)
-		if statusErr := NewStatusPatch(gw.ResourceVersion).
-			Add(conditionsStatusField, gw.Status.Conditions).
-			Add(observedGenerationStatusField, gw.Status.ObservedGeneration).
-			Apply(ctx, r.Client, &gw); statusErr != nil {
-			return ctrl.Result{}, fmt.Errorf("rendering batch-gateway chart: %w; failed to patch status: %w", err, statusErr)
-		}
-		return ctrl.Result{}, fmt.Errorf("rendering batch-gateway chart: %w", err)
+		return r.failRender(ctx, &gw, "batch-gateway chart", err)
 	}
 
-	if gw.Spec.Processor.DispatchMode == dispatchModeAsync && gw.Spec.Processor.AsyncConfig != nil {
-		if r.AsyncHelmRenderer == nil {
-			return ctrl.Result{}, errors.New("async dispatch mode requires an async helm renderer, but none was configured")
-		}
-		asyncObjects, err := r.AsyncHelmRenderer.RenderAsyncChart(&gw, localSecretName)
-		if err != nil {
-			gw.Status.ObservedGeneration = gw.Generation
-			meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-				Type:               conditionReady,
-				Status:             metav1.ConditionFalse,
-				Reason:             "RenderFailed",
-				Message:            err.Error(),
-				ObservedGeneration: gw.Generation,
-			})
-			r.Recorder.Eventf(&gw, corev1.EventTypeWarning, "RenderFailed", "Async chart render failed: %s", err)
-			if statusErr := NewStatusPatch(gw.ResourceVersion).
-				Add(conditionsStatusField, gw.Status.Conditions).
-				Add(observedGenerationStatusField, gw.Status.ObservedGeneration).
-				Apply(ctx, r.Client, &gw); statusErr != nil {
-				return ctrl.Result{}, fmt.Errorf("rendering async chart: %w; failed to patch status: %w", err, statusErr)
-			}
-			return ctrl.Result{}, fmt.Errorf("rendering async chart: %w", err)
-		}
-		batchObjects = append(batchObjects, asyncObjects...)
+	// Async dispatch is the only supported mode; validation guarantees
+	// asyncConfig is set, so the async chart is always rendered.
+	if r.AsyncHelmRenderer == nil {
+		return ctrl.Result{}, errors.New("async dispatch requires an async helm renderer, but none was configured")
 	}
+	asyncObjects, err := r.AsyncHelmRenderer.RenderAsyncChart(&gw, localSecretName)
+	if err != nil {
+		return r.failRender(ctx, &gw, "async chart", err)
+	}
+	batchObjects = append(batchObjects, asyncObjects...)
 
 	allObjects := batchObjects
 	for _, obj := range allObjects {
@@ -302,7 +255,7 @@ func (r *LLMBatchGatewayReconciler) reconcile(ctx context.Context, req ctrl.Requ
 				logger.V(1).Info("skipping resource (CRD not installed)", "kind", obj.GetKind(), "name", obj.GetName())
 				continue
 			}
-			r.Recorder.Eventf(&gw, corev1.EventTypeWarning, "ApplyFailed", "Failed to apply %s/%s: %s", obj.GetKind(), obj.GetName(), err)
+			r.Recorder.Eventf(&gw, corev1.EventTypeWarning, reasonApplyFailed, "Failed to apply %s/%s: %s", obj.GetKind(), obj.GetName(), err)
 			return ctrl.Result{}, fmt.Errorf("applying %s/%s: %w", obj.GetKind(), obj.GetName(), err)
 		}
 		logger.V(2).Info("applied resource", "kind", obj.GetKind(), "name", obj.GetName())
@@ -317,6 +270,65 @@ func (r *LLMBatchGatewayReconciler) reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	return ctrl.Result{RequeueAfter: r.SyncPeriod}, nil
+}
+
+// statusFailure describes a failure to record on the LLMBatchGateway status.
+// The same message is used for the conditions and for the warning event.
+type statusFailure struct {
+	reason     string
+	message    string
+	conditions []string
+}
+
+// recordFailure marks the given conditions False with the failure's reason and
+// message, emits a warning event and patches the status subresource. A non-nil
+// return means the status itself could not be patched.
+func (r *LLMBatchGatewayReconciler) recordFailure(ctx context.Context, gw *batchv1alpha1.LLMBatchGateway, failure statusFailure) error {
+	gw.Status.ObservedGeneration = gw.Generation
+	for _, condType := range failure.conditions {
+		meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             metav1.ConditionFalse,
+			Reason:             failure.reason,
+			Message:            failure.message,
+			ObservedGeneration: gw.Generation,
+		})
+	}
+	r.Recorder.Event(gw, corev1.EventTypeWarning, failure.reason, failure.message)
+
+	if err := NewStatusPatch(gw.ResourceVersion).
+		Add(conditionsStatusField, gw.Status.Conditions).
+		Add(observedGenerationStatusField, gw.Status.ObservedGeneration).
+		Apply(ctx, r.Client, gw); err != nil {
+		return fmt.Errorf("patching status after %s: %w", failure.reason, err)
+	}
+	return nil
+}
+
+// allConditionTypes lists every condition this operator maintains.
+func allConditionTypes() []string {
+	return []string{
+		conditionReady,
+		apiServerCondition.conditionType,
+		processorCondition.conditionType,
+		gcCondition.conditionType,
+		asyncProcessorCondition.conditionType,
+	}
+}
+
+// failRender records a chart render failure on the resource and returns the
+// resulting reconcile error.
+func (r *LLMBatchGatewayReconciler) failRender(ctx context.Context, gw *batchv1alpha1.LLMBatchGateway, chart string, renderErr error) (ctrl.Result, error) {
+	failure := statusFailure{
+		reason:     reasonRenderFailed,
+		message:    fmt.Sprintf("%s render failed: %s", chart, renderErr),
+		conditions: []string{conditionReady},
+	}
+	wrapErr := fmt.Errorf("rendering %s: %w", chart, renderErr)
+	if err := r.recordFailure(ctx, gw, failure); err != nil {
+		return ctrl.Result{}, fmt.Errorf("rendering %s: %w; failed to patch status: %w", chart, renderErr, err)
+	}
+	return ctrl.Result{}, wrapErr
 }
 
 func (r *LLMBatchGatewayReconciler) deleteOrphanedResources(
@@ -403,9 +415,10 @@ func (r *LLMBatchGatewayReconciler) updateStatus(ctx context.Context, gw *batchv
 			continue
 		}
 
+		replicas, readyReplicas := deploymentReplicaStatus(d)
 		setComponentStatus(componentStatus, component, &batchv1alpha1.ComponentReplicaStatus{
-			Replicas:      d.Status.Replicas,
-			ReadyReplicas: d.Status.ReadyReplicas,
+			Replicas:      replicas,
+			ReadyReplicas: readyReplicas,
 		})
 	}
 
@@ -426,55 +439,20 @@ func (r *LLMBatchGatewayReconciler) updateStatus(ctx context.Context, gw *batchv
 			continue
 		}
 
+		replicas, readyReplicas := statefulSetReplicaStatus(ss)
 		setComponentStatus(componentStatus, component, &batchv1alpha1.ComponentReplicaStatus{
-			Replicas:      ss.Status.Replicas,
-			ReadyReplicas: ss.Status.ReadyReplicas,
+			Replicas:      replicas,
+			ReadyReplicas: readyReplicas,
 		})
 	}
 
 	gw.Status.ComponentStatus = componentStatus
 	gw.Status.ObservedGeneration = gw.Generation
 
-	apiAvailable := componentStatus.APIServer != nil && componentStatus.APIServer.ReadyReplicas >= 1
-	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-		Type:               conditionAPIServerAvailable,
-		Status:             conditionStatus(apiAvailable),
-		Reason:             conditionReason(apiAvailable, "Available", "Unavailable"),
-		Message:            conditionMessage(apiAvailable, "API server has at least one ready replica", "API server has no ready replicas"),
-		ObservedGeneration: gw.Generation,
-	})
-
-	procAvailable := componentStatus.Processor != nil && componentStatus.Processor.ReadyReplicas >= 1
-	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-		Type:               conditionProcessorAvailable,
-		Status:             conditionStatus(procAvailable),
-		Reason:             conditionReason(procAvailable, "Available", "Unavailable"),
-		Message:            conditionMessage(procAvailable, "Processor has at least one ready replica", "Processor has no ready replicas"),
-		ObservedGeneration: gw.Generation,
-	})
-
-	gcAvailable := componentStatus.GC != nil && componentStatus.GC.ReadyReplicas >= 1
-	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-		Type:               conditionGCAvailable,
-		Status:             conditionStatus(gcAvailable),
-		Reason:             conditionReason(gcAvailable, "Available", "Unavailable"),
-		Message:            conditionMessage(gcAvailable, "GC has at least one ready replica", "GC has no ready replicas"),
-		ObservedGeneration: gw.Generation,
-	})
-
-	asyncAvailable := true
-	if gw.Spec.Processor.DispatchMode != dispatchModeAsync { // when sync we still treat available as true
-		meta.RemoveStatusCondition(&gw.Status.Conditions, conditionAsyncProcessorAvailable)
-	} else {
-		asyncAvailable = componentStatus.AsyncProcessor != nil && componentStatus.AsyncProcessor.ReadyReplicas >= 1 // TODO: refactor this with all other 3, should only mark ready when all replica ready
-		meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
-			Type:               conditionAsyncProcessorAvailable,
-			Status:             conditionStatus(asyncAvailable),
-			Reason:             conditionReason(asyncAvailable, "Available", "Unavailable"),
-			Message:            conditionMessage(asyncAvailable, "Async processor has at least one ready replica", "Async processor has no ready replicas"),
-			ObservedGeneration: gw.Generation,
-		})
-	}
+	apiAvailable := setComponentAvailableCondition(gw, apiServerCondition, componentStatus.APIServer)
+	procAvailable := setComponentAvailableCondition(gw, processorCondition, componentStatus.Processor)
+	gcAvailable := setComponentAvailableCondition(gw, gcCondition, componentStatus.GC)
+	asyncAvailable := setComponentAvailableCondition(gw, asyncProcessorCondition, componentStatus.AsyncProcessor)
 
 	ready := apiAvailable && procAvailable && gcAvailable && asyncAvailable
 
@@ -489,17 +467,17 @@ func (r *LLMBatchGatewayReconciler) updateStatus(ctx context.Context, gw *batchv
 	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
 		Type:               conditionReady,
 		Status:             conditionStatus(ready),
-		Reason:             conditionReason(ready, "AllComponentsReady", "ComponentsNotReady"),
-		Message:            conditionMessage(ready, "All components have at least one ready replica", "One or more components have no ready replicas"),
+		Reason:             conditionReason(ready, reasonReady, reasonNotReady),
+		Message:            conditionMessage(ready, readyMessage, notReadyMessage),
 		ObservedGeneration: gw.Generation,
 	})
 
 	newReadyStatus := conditionStatus(ready)
 	if prevReadyStatus != newReadyStatus {
 		if ready {
-			r.Recorder.Event(gw, corev1.EventTypeNormal, "Ready", "All components have at least one ready replica")
+			r.Recorder.Event(gw, corev1.EventTypeNormal, reasonReady, readyMessage)
 		} else {
-			r.Recorder.Event(gw, corev1.EventTypeWarning, "NotReady", "One or more components have no ready replicas")
+			r.Recorder.Event(gw, corev1.EventTypeWarning, reasonNotReady, notReadyMessage)
 		}
 	}
 
@@ -651,6 +629,78 @@ func setComponentStatus(componentStatus *batchv1alpha1.ComponentStatus, componen
 	}
 }
 
+// setComponentAvailableCondition records the Available condition for one
+// component and reports whether it is fully ready: at least one replica exists
+// and every replica is ready. A component scaled to zero, and one still rolling
+// out, are therefore not available.
+// deploymentReplicaStatus returns the replica counts reported for a Deployment.
+// Readiness is suppressed until the rollout is complete, using the same checks
+// as `kubectl rollout status`: the controller observed the latest spec, every
+// desired replica is on the current pod template, no outdated replica is left,
+// and every desired replica is ready. status.readyReplicas alone is not enough,
+// because it also counts ready pods from the previous ReplicaSet.
+func deploymentReplicaStatus(d *appsv1.Deployment) (replicas, readyReplicas int32) {
+	desired := int32(1)
+	if d.Spec.Replicas != nil {
+		desired = *d.Spec.Replicas
+	}
+	// Equality, not greater-or-equal: during a scale-down every pod already runs
+	// the current template, so updatedReplicas and replicas both stay at the old
+	// count until the surplus pods are gone. A surge pod from a rolling update is
+	// also surplus until it terminates.
+	rolledOut := d.Status.ObservedGeneration >= d.Generation &&
+		d.Status.UpdatedReplicas == desired &&
+		d.Status.Replicas == desired &&
+		d.Status.ReadyReplicas >= desired
+	return desired, reportedReadyReplicas(d.Status.ReadyReplicas, desired, rolledOut)
+}
+
+// statefulSetReplicaStatus is deploymentReplicaStatus for StatefulSets, which
+// report revision names instead of a per-replica template hash.
+func statefulSetReplicaStatus(ss *appsv1.StatefulSet) (replicas, readyReplicas int32) {
+	desired := int32(1)
+	if ss.Spec.Replicas != nil {
+		desired = *ss.Spec.Replicas
+	}
+	rolledOut := ss.Status.ObservedGeneration >= ss.Generation &&
+		ss.Status.UpdatedReplicas == desired &&
+		ss.Status.Replicas == desired &&
+		ss.Status.ReadyReplicas >= desired &&
+		ss.Status.CurrentRevision == ss.Status.UpdateRevision
+	return desired, reportedReadyReplicas(ss.Status.ReadyReplicas, desired, rolledOut)
+}
+
+// reportedReadyReplicas hides readiness while a rollout is in progress and caps
+// the count at the desired replicas, so a scale-down does not report more ready
+// replicas than were asked for.
+func reportedReadyReplicas(ready, desired int32, rolledOut bool) int32 {
+	switch {
+	case !rolledOut:
+		return 0
+	case ready > desired:
+		return desired
+	default:
+		return ready
+	}
+}
+
+func setComponentAvailableCondition(gw *batchv1alpha1.LLMBatchGateway, cond componentCondition, status *batchv1alpha1.ComponentReplicaStatus) bool {
+	var replicas, readyReplicas int32
+	if status != nil {
+		replicas, readyReplicas = status.Replicas, status.ReadyReplicas
+	}
+	available := replicas > 0 && readyReplicas >= replicas
+
+	meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
+		Type:               cond.conditionType,
+		Status:             conditionStatus(available),
+		Reason:             conditionReason(available, reasonAvailable, reasonUnavailable),
+		Message:            fmt.Sprintf("%s: %d/%d replicas ready", cond.name, readyReplicas, replicas),
+		ObservedGeneration: gw.Generation,
+	})
+	return available
+}
+
 func conditionStatus(ok bool) metav1.ConditionStatus {
 	if ok {
 		return metav1.ConditionTrue
@@ -669,131 +719,178 @@ func validateSpec(gw *batchv1alpha1.LLMBatchGateway) error {
 	if gw.Spec.DBBackend != "" && gw.Spec.DBBackend != dbBackendPostgreSQL {
 		return fmt.Errorf("spec.dbBackend %q is not supported; only \"postgresql\" is supported by batch-gateway", gw.Spec.DBBackend)
 	}
-	if gw.Spec.Redis != nil {
-		return errors.New("spec.redis is not supported by batch-gateway; configure Redis under spec.processor.asyncConfig")
+	// Only "sync" is refused: "async" is accepted because it is the default in
+	// released CRDs and resources carry it explicitly, while a resource stored
+	// before synchronous dispatch was removed can still say "sync".
+	if gw.Spec.Processor.DispatchMode == dispatchModeSync { //nolint:staticcheck // deprecated field is read to reject sync
+		return fmt.Errorf("processor.dispatchMode %q is not supported; synchronous dispatch was removed, drain this resource and re-deploy it with async dispatch", dispatchModeSync)
 	}
-	hasGlobal := gw.Spec.Processor.GlobalInferenceGateway != nil
-	hasModel := len(gw.Spec.Processor.ModelGateways) > 0
-	if !hasGlobal && !hasModel {
-		return errors.New("processor must have either globalInferenceGateway or modelGateways configured")
-	}
-	if hasGlobal && hasModel {
-		return errors.New("processor cannot have both globalInferenceGateway and modelGateways configured")
-	}
-	if gw.Spec.Processor.DispatchMode != dispatchModeAsync {
-		if hasGlobal && hasQueueNames(*gw.Spec.Processor.GlobalInferenceGateway) {
-			return errors.New("processor.globalInferenceGateway.requestQueueName and resultQueueName are supported only in async modelGateways")
-		}
-		for model, gateway := range gw.Spec.Processor.ModelGateways {
-			if hasQueueNames(gateway) {
-				return fmt.Errorf("processor.modelGateways[%s].requestQueueName and resultQueueName are supported only when processor.dispatchMode is \"async\"", model)
-			}
-		}
-		return nil
-	}
-
 	if gw.Spec.Processor.AsyncConfig == nil {
-		return errors.New("asyncConfig is required when spec.processor.dispatchMode set to \"async\"")
+		return errors.New("processor.asyncConfig is required")
 	}
 	if gw.Spec.Processor.AsyncConfig.Redis != nil && gw.Spec.Processor.AsyncConfig.SQL != nil {
 		return errors.New("processor.asyncConfig.redis and processor.asyncConfig.sql are mutually exclusive")
 	}
 	if gw.Spec.Processor.AsyncConfig.Redis == nil && gw.Spec.Processor.AsyncConfig.SQL == nil {
-		return errors.New("processor.asyncConfig.redis or processor.asyncConfig.sql is required when processor.dispatchMode is \"async\"")
+		return errors.New("processor.asyncConfig.redis or processor.asyncConfig.sql is required")
 	}
 	if gw.Spec.Processor.AsyncConfig.ResultPollTimeout == "" {
-		return errors.New("processor.asyncConfig.resultPollTimeout is required when processor.dispatchMode is \"async\"")
+		return errors.New("processor.asyncConfig.resultPollTimeout is required")
 	}
-	if hasGlobal {
-		return errors.New("processor.globalInferenceGateway is not supported when processor.dispatchMode is \"async\"; use processor.modelGateways")
-	}
-	if !hasModel {
-		return errors.New("processor.modelGateways is required when processor.dispatchMode is \"async\"")
+	if len(gw.Spec.Processor.ModelGateways) == 0 {
+		return errors.New("processor.modelGateways is required")
 	}
 	for model, gateway := range gw.Spec.Processor.ModelGateways {
 		if gateway.InferencePoolName == "" {
-			return fmt.Errorf("processor.modelGateways[%s].inferencePoolName is required when processor.dispatchMode is \"async\"", model)
+			return fmt.Errorf("processor.modelGateways[%s].inferencePoolName is required", model)
 		}
 		if (gateway.RequestQueueName == "") != (gateway.ResultQueueName == "") {
 			return fmt.Errorf("processor.modelGateways[%s].requestQueueName and resultQueueName must both be set or both be empty", model)
 		}
 	}
-	if gw.Spec.Processor.AsyncConfig.SQL != nil {
-		// The Batch Gateway processor polls <resultQueue>:<consumerID> once per
-		// model, and SQL result reads are destructive. Models sharing a result
-		// queue would consume and drop each other's results.
-		models := slices.Sorted(maps.Keys(gw.Spec.Processor.ModelGateways))
-		poolModels := make(map[string]string, len(models))
-		for _, model := range models {
-			gateway := gw.Spec.Processor.ModelGateways[model]
-			if other, ok := poolModels[gateway.InferencePoolName]; ok {
-				return fmt.Errorf("processor.modelGateways[%s] and processor.modelGateways[%s] use the same SQL inference pool %q; each model must use a distinct inferencePoolName", other, model, gateway.InferencePoolName)
-			}
-			poolModels[gateway.InferencePoolName] = model
-		}
+	switch {
+	case gw.Spec.Processor.AsyncConfig.Redis != nil:
+		return validateAsyncRedisConfig(gw)
+	case gw.Spec.Processor.AsyncConfig.SQL != nil:
+		return validateAsyncSQLConfig(gw)
+	}
+	return nil
+}
 
-		resultQueues := make(map[string]string, len(models))
-		for _, model := range models {
-			gateway := gw.Spec.Processor.ModelGateways[model]
-			resultQueue := sqlResultQueueNameFor(gateway)
-			if other, ok := resultQueues[resultQueue]; ok {
-				return fmt.Errorf("processor.modelGateways[%s] and processor.modelGateways[%s] resolve to the same SQL result queue %q; set distinct requestQueueName/resultQueueName pairs", other, model, resultQueue)
-			}
-			resultQueues[resultQueue] = model
+// validateAsyncRedisConfig validates the Redis async queue transport. The
+// dispatcher queue names must match the ones the batch processor publishes to,
+// and every queue needs an inference gateway URL, either its own igwBaseURL or
+// the shared asyncConfig.inferenceGateway.url.
+func validateAsyncRedisConfig(gw *batchv1alpha1.LLMBatchGateway) error {
+	ac := gw.Spec.Processor.AsyncConfig
+
+	// When queuesConfig is omitted the operator derives one queue per model
+	// gateway, instead of leaving the dispatcher on its built-in
+	// request-sortedset queue, which the processor never publishes to.
+	if len(ac.Redis.QueuesConfig) > 0 {
+		if err := validateAsyncQueueCoverage("redis", gw, ac.Redis.QueuesConfig); err != nil {
+			return err
 		}
-		if len(gw.Spec.Processor.AsyncConfig.SQL.QueuesConfig) > 0 {
-			configured := make(map[string]struct{}, len(gw.Spec.Processor.AsyncConfig.SQL.QueuesConfig))
-			for _, queue := range gw.Spec.Processor.AsyncConfig.SQL.QueuesConfig {
-				if _, exists := configured[queue.Name]; exists {
-					return fmt.Errorf("processor.asyncConfig.sql.queuesConfig contains duplicate queue %q", queue.Name)
-				}
-				configured[queue.Name] = struct{}{}
-			}
-			for _, model := range models {
-				gateway := gw.Spec.Processor.ModelGateways[model]
-				requestQueue := sqlRequestQueueName(gateway)
-				if _, ok := configured[requestQueue]; !ok {
-					return fmt.Errorf("processor.asyncConfig.sql.queuesConfig is missing request queue %q required by processor.modelGateways[%s]", requestQueue, model)
-				}
-			}
+	}
+	queues := redisQueues(gw)
+
+	if err := validateAsyncQueueGatewayURL("Redis", queues, ac.InferenceGateway); err != nil {
+		return err
+	}
+	return validateAsyncPrometheusGates("Redis", queues, ac.WorkerPools, ac.PrometheusURL)
+}
+
+// validateAsyncSQLConfig validates the SQL async queue transport.
+func validateAsyncSQLConfig(gw *batchv1alpha1.LLMBatchGateway) error {
+	ac := gw.Spec.Processor.AsyncConfig
+
+	// The Batch Gateway processor polls <resultQueue>:<consumerID> once per
+	// model, and SQL result reads are destructive. Models sharing a result
+	// queue would consume and drop each other's results.
+	models := sortedModelNames(gw)
+	poolModels := make(map[string]string, len(models))
+	for _, model := range models {
+		gateway := gw.Spec.Processor.ModelGateways[model]
+		if other, ok := poolModels[gateway.InferencePoolName]; ok {
+			return fmt.Errorf("processor.modelGateways[%s] and processor.modelGateways[%s] use the same SQL inference pool %q; each model must use a distinct inferencePoolName", other, model, gateway.InferencePoolName)
 		}
-		// The dispatcher requires igw_base_url on every queue; generated
-		// default queues carry none, so they need asyncConfig.inferenceGateway.
-		if ig := gw.Spec.Processor.AsyncConfig.InferenceGateway; ig == nil || ig.URL == "" {
-			queues := gw.Spec.Processor.AsyncConfig.SQL.QueuesConfig
-			if len(queues) == 0 {
-				queues = sqlQueueDefaults(gw)
-			}
-			for _, queue := range queues {
-				if queue.IGWBaseURL == "" {
-					return fmt.Errorf("processor.asyncConfig.inferenceGateway.url is required when SQL queue %q does not set igwBaseURL", queue.Name)
-				}
-			}
+		poolModels[gateway.InferencePoolName] = model
+	}
+
+	resultQueues := make(map[string]string, len(models))
+	for _, model := range models {
+		gateway := gw.Spec.Processor.ModelGateways[model]
+		resultQueue := sqlResultQueueNameFor(gateway)
+		if other, ok := resultQueues[resultQueue]; ok {
+			return fmt.Errorf("processor.modelGateways[%s] and processor.modelGateways[%s] resolve to the same SQL result queue %q; set distinct requestQueueName/resultQueueName pairs", other, model, resultQueue)
 		}
-		if gw.Spec.Processor.AsyncConfig.PrometheusURL == "" {
-			for _, queue := range gw.Spec.Processor.AsyncConfig.SQL.QueuesConfig {
-				if isPrometheusGate(queue.GateType) {
-					return fmt.Errorf("processor.asyncConfig.prometheusURL is required for SQL queue %q with gate %q", queue.Name, queue.GateType)
-				}
-			}
-			for _, pool := range gw.Spec.Processor.AsyncConfig.WorkerPools {
-				if isPrometheusGate(pool.GateType) {
-					return fmt.Errorf("processor.asyncConfig.prometheusURL is required for worker pool %q with gate %q", pool.Name, pool.GateType)
-				}
-			}
+		resultQueues[resultQueue] = model
+	}
+
+	if len(ac.SQL.QueuesConfig) > 0 {
+		if err := validateAsyncQueueCoverage("sql", gw, ac.SQL.QueuesConfig); err != nil {
+			return err
+		}
+	}
+	queues := sqlQueues(gw)
+
+	if err := validateAsyncQueueGatewayURL("SQL", queues, ac.InferenceGateway); err != nil {
+		return err
+	}
+	return validateAsyncPrometheusGates("SQL", queues, ac.WorkerPools, ac.PrometheusURL)
+}
+
+// validateAsyncQueueCoverage requires the configured queues to match the request
+// queues the processor publishes to, one for one: a missing queue leaves results
+// stranded, and an extra queue polls a queue that nothing writes to.
+func validateAsyncQueueCoverage(transport string, gw *batchv1alpha1.LLMBatchGateway, queues []batchv1alpha1.AsyncQueueConfig) error {
+	published := make(map[string]string, len(gw.Spec.Processor.ModelGateways))
+	for _, model := range sortedModelNames(gw) {
+		published[requestQueueNameFor(gw.Spec.Processor.ModelGateways[model])] = model
+	}
+
+	configured := make(map[string]struct{}, len(queues))
+	for _, queue := range queues {
+		if _, exists := configured[queue.Name]; exists {
+			return fmt.Errorf("processor.asyncConfig.%s.queuesConfig contains duplicate queue %q", transport, queue.Name)
+		}
+		configured[queue.Name] = struct{}{}
+	}
+
+	// Report missing queues before extra ones: an under-specified config should
+	// say which queue is absent, not complain about the ones it does list.
+	for _, model := range sortedModelNames(gw) {
+		requestQueue := requestQueueNameFor(gw.Spec.Processor.ModelGateways[model])
+		if _, ok := configured[requestQueue]; !ok {
+			return fmt.Errorf("processor.asyncConfig.%s.queuesConfig is missing request queue %q required by processor.modelGateways[%s]", transport, requestQueue, model)
+		}
+	}
+
+	for _, queue := range queues {
+		if _, ok := published[queue.Name]; !ok {
+			return fmt.Errorf("processor.asyncConfig.%s.queuesConfig contains queue %q that no processor.modelGateways entry publishes to", transport, queue.Name)
 		}
 	}
 	return nil
 }
 
-func hasQueueNames(gateway batchv1alpha1.InferenceGatewaySpec) bool {
-	return gateway.RequestQueueName != "" || gateway.ResultQueueName != ""
+// validateAsyncQueueGatewayURL requires an inference gateway URL, either on the
+// queue itself or shared through asyncConfig.inferenceGateway. The dispatcher
+// cannot dispatch a queue without one.
+func validateAsyncQueueGatewayURL(transport string, queues []batchv1alpha1.AsyncQueueConfig, ig *batchv1alpha1.InferenceGatewaySpec) error {
+	if ig != nil && ig.URL != "" {
+		return nil
+	}
+	for _, queue := range queues {
+		if queue.IGWBaseURL == "" {
+			return fmt.Errorf("processor.asyncConfig.inferenceGateway.url is required when %s queue %q does not set igwBaseURL", transport, queue.Name)
+		}
+	}
+	return nil
+}
+
+// validateAsyncPrometheusGates requires prometheusURL for any queue or worker
+// pool that gates on Prometheus metrics.
+func validateAsyncPrometheusGates(transport string, queues []batchv1alpha1.AsyncQueueConfig, pools []batchv1alpha1.AsyncWorkerPool, prometheusURL string) error {
+	if prometheusURL != "" {
+		return nil
+	}
+	for _, queue := range queues {
+		if isPrometheusGate(queue.GateType) {
+			return fmt.Errorf("processor.asyncConfig.prometheusURL is required for %s queue %q with gate %q", transport, queue.Name, queue.GateType)
+		}
+	}
+	for _, pool := range pools {
+		if isPrometheusGate(pool.GateType) {
+			return fmt.Errorf("processor.asyncConfig.prometheusURL is required for worker pool %q with gate %q", pool.Name, pool.GateType)
+		}
+	}
+	return nil
 }
 
 func isPrometheusGate(gateType string) bool {
 	return gateType == gatePrometheusBudget || gateType == gatePrometheusQuery || gateType == gatePrometheusSaturation
 }
-
 func conditionMessage(ok bool, trueMsg, falseMsg string) string {
 	if ok {
 		return trueMsg
