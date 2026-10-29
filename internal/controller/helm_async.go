@@ -97,17 +97,7 @@ func specToAsyncHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 			transportConfig["enable_tracing"] = true
 		}
 
-		queueConfigs := ac.Redis.QueuesConfig
-		if len(queueConfigs) == 0 {
-			queueConfigs = []batchv1alpha1.AsyncQueueConfig{{
-				Name:           "request-sortedset",
-				RequestPathURL: ac.Redis.RequestPathURL,
-				GateType:       ac.Redis.GateType,
-				GateParams:     ac.Redis.GateParams,
-			}}
-		}
-
-		transportConfig["queues"] = asyncQueueValues(queueConfigs, gatewayURL)
+		transportConfig["queues"] = asyncQueueValues(redisQueues(gw), gatewayURL)
 		ap["transport"] = asyncTransportRedis
 		ap["transportConfig"] = transportConfig
 	} else if ac.SQL != nil {
@@ -135,11 +125,7 @@ func specToAsyncHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 		if ac.SQL.HandoffTimeoutSeconds != nil {
 			transportConfig["handoff_timeout_seconds"] = int64(*ac.SQL.HandoffTimeoutSeconds)
 		}
-		queueConfigs := ac.SQL.QueuesConfig
-		if len(queueConfigs) == 0 {
-			queueConfigs = sqlQueueDefaults(gw)
-		}
-		transportConfig["queues"] = asyncQueueValues(queueConfigs, gatewayURL)
+		transportConfig["queues"] = asyncQueueValues(sqlQueues(gw), gatewayURL)
 		ap["transport"] = asyncTransportSQL
 		ap["transportConfig"] = transportConfig
 	}
@@ -273,10 +259,15 @@ func asyncQueueValues(queueConfigs []batchv1alpha1.AsyncQueueConfig, gatewayURL 
 	return queues
 }
 
-func sortedModelGateways(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.InferenceGatewaySpec {
-	models := slices.Sorted(maps.Keys(gw.Spec.Processor.ModelGateways))
+// sortedModelNames returns the model names in a stable order.
+func sortedModelNames(gw *batchv1alpha1.LLMBatchGateway) []string {
+	return slices.Sorted(maps.Keys(gw.Spec.Processor.ModelGateways))
+}
 
-	gateways := make([]batchv1alpha1.InferenceGatewaySpec, 0, len(models))
+func sortedModelGateways(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.ModelGatewaySpec {
+	models := sortedModelNames(gw)
+
+	gateways := make([]batchv1alpha1.ModelGatewaySpec, 0, len(models))
 	for _, model := range models {
 		gateways = append(gateways, gw.Spec.Processor.ModelGateways[model])
 	}
@@ -289,7 +280,7 @@ func sortedModelGateways(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.Infe
 // <base>:<consumerID>, which the dispatcher honors per request, so each model
 // keeps its own result queue. The first model's queue (by sorted name) is used
 // only as the fallback.
-func sqlResultQueueNameFor(gateway batchv1alpha1.InferenceGatewaySpec) string {
+func sqlResultQueueNameFor(gateway batchv1alpha1.ModelGatewaySpec) string {
 	if gateway.ResultQueueName != "" {
 		return gateway.ResultQueueName
 	}
@@ -304,19 +295,49 @@ func sqlResultQueueName(gw *batchv1alpha1.LLMBatchGateway) string {
 	return sqlResultQueueNameFor(gateways[0])
 }
 
-func sqlRequestQueueName(gateway batchv1alpha1.InferenceGatewaySpec) string {
+// requestQueueNameFor returns the request queue a model publishes to.
+func requestQueueNameFor(gateway batchv1alpha1.ModelGatewaySpec) string {
 	if gateway.RequestQueueName != "" {
 		return gateway.RequestQueueName
 	}
 	return asyncRequestQueueName(gateway.InferencePoolName)
 }
 
-func sqlQueueDefaults(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+// redisQueues returns the Redis dispatcher queues: the configured ones, or one
+// per model gateway carrying the top-level Redis queue settings. The latter
+// matches the request queues the batch processor publishes to.
+func redisQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+	ac := gw.Spec.Processor.AsyncConfig
+	if len(ac.Redis.QueuesConfig) > 0 {
+		return ac.Redis.QueuesConfig
+	}
+	queues := defaultAsyncQueues(gw)
+	for i := range queues {
+		queues[i].RequestPathURL = ac.Redis.RequestPathURL
+		queues[i].GateType = ac.Redis.GateType
+		queues[i].GateParams = ac.Redis.GateParams
+	}
+	return queues
+}
+
+// sqlQueues returns the SQL dispatcher queues: the configured ones, or one per
+// model gateway.
+func sqlQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+	if ac := gw.Spec.Processor.AsyncConfig; len(ac.SQL.QueuesConfig) > 0 {
+		return ac.SQL.QueuesConfig
+	}
+	return defaultAsyncQueues(gw)
+}
+
+// defaultAsyncQueues derives one request queue per model gateway, deduplicated by
+// queue name. Used for both async transports when queuesConfig is omitted, and it
+// matches the names the batch processor publishes to.
+func defaultAsyncQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
 	gateways := sortedModelGateways(gw)
 	queues := make([]batchv1alpha1.AsyncQueueConfig, 0, len(gateways))
 	seen := make(map[string]struct{}, len(gateways))
 	for _, gateway := range gateways {
-		name := sqlRequestQueueName(gateway)
+		name := requestQueueNameFor(gateway)
 		if _, ok := seen[name]; ok {
 			continue
 		}

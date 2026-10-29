@@ -13,7 +13,6 @@ import (
 func minimalAsyncGateway() *batchv1alpha1.LLMBatchGateway {
 	gw := minimalGateway()
 	concurrency := int32(8)
-	gw.Spec.Processor.DispatchMode = dispatchModeAsync
 	gw.Spec.Processor.AsyncConfig = &batchv1alpha1.AsyncProcessorSpec{
 		Concurrency:  &concurrency,
 		DrainTimeout: "2m",
@@ -86,8 +85,11 @@ func TestSpecToAsyncHelmValues(t *testing.T) {
 			t.Fatalf("transportConfig.queues = %v, want one queue", transportConfig["queues"])
 		}
 		queue := queues[0].(map[string]any)
-		if got := queue["queue_name"]; got != "request-sortedset" {
-			t.Errorf("transportConfig.queues[0].queue_name = %v, want request-sortedset", got)
+		// With no queuesConfig the operator derives the queue the processor
+		// publishes to, instead of the dispatcher default request-sortedset.
+		wantQueue := asyncRequestQueueName("pool-a")
+		if got := queue["queue_name"]; got != wantQueue {
+			t.Errorf("transportConfig.queues[0].queue_name = %v, want %s", got, wantQueue)
 		}
 		if got := queue["igw_base_url"]; got != testInferenceGatewayURL {
 			t.Errorf("transportConfig.queues[0].igw_base_url = %v, want %s", got, testInferenceGatewayURL)
@@ -195,8 +197,7 @@ func TestSpecToAsyncHelmValues_TransportQueues(t *testing.T) {
 
 func TestSpecToAsyncHelmValues_SQLTransport(t *testing.T) {
 	g := minimalAsyncGateway()
-	g.Spec.Processor.GlobalInferenceGateway = nil
-	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
+	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
 		"model-a": {InferencePoolName: "pool-a"},
 	}
 	g.Spec.Processor.AsyncConfig.Redis = nil
@@ -227,8 +228,7 @@ func TestSpecToAsyncHelmValues_SQLTransport(t *testing.T) {
 
 func TestSpecToAsyncHelmValues_SQLTransportExplicitResultQueue(t *testing.T) {
 	g := minimalAsyncGateway()
-	g.Spec.Processor.GlobalInferenceGateway = nil
-	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
+	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
 		"model-a": {
 			InferencePoolName: "pool-a",
 			RequestQueueName:  "request-sql",
@@ -562,8 +562,7 @@ func hasEnvSecret(env []any, name, secretName, secretKey string) bool {
 
 func TestSpecToAsyncHelmValues_SQLDefaultQueuesDeduplicated(t *testing.T) {
 	g := minimalAsyncGateway()
-	g.Spec.Processor.GlobalInferenceGateway = nil
-	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
+	g.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
 		"model-a": {InferencePoolName: "pool-a", RequestQueueName: "request-shared", ResultQueueName: "result-a"},
 		"model-b": {InferencePoolName: "pool-b", RequestQueueName: "request-shared", ResultQueueName: "result-b"},
 	}
