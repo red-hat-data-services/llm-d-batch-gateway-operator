@@ -24,12 +24,10 @@ spec:
   processor:
     replicas: 1
     imagePullPolicy: IfNotPresent
-    dispatchMode: async
     modelGateways:
       sim-model:
         inferencePoolName: sim-pool-scrape
     asyncConfig:
-      replicas: 1
       concurrency: 1
       drainTimeout: 2m
       resultPollTimeout: 30s

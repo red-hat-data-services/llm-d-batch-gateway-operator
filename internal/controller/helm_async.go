@@ -1,10 +1,27 @@
 package controller
 
 import (
+	"maps"
+	"slices"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	batchv1alpha1 "github.com/opendatahub-io/llm-d-batch-gateway-operator/api/v1alpha1"
 )
+
+const (
+	asyncQueuePrefix    = "llm-d-async:"
+	asyncTransportRedis = "redis-sortedset"
+	asyncTransportSQL   = "sql"
+)
+
+func asyncRequestQueueName(pool string) string {
+	return asyncQueuePrefix + "requests:" + pool
+}
+
+func asyncResultQueueName(pool string) string {
+	return asyncQueuePrefix + "results:" + pool
+}
 
 func (h *HelmRenderer) RenderAsyncChart(gw *batchv1alpha1.LLMBatchGateway, secretName string) ([]*unstructured.Unstructured, error) {
 	return h.renderChart(gw, specToAsyncHelmValues(gw, secretName, h.images), func(obj *unstructured.Unstructured) {
@@ -18,7 +35,7 @@ func (h *HelmRenderer) RenderAsyncChart(gw *batchv1alpha1.LLMBatchGateway, secre
 	})
 }
 
-// specToAsyncHelmValues maps the CRD spec to upstream async-processor Helm values.
+// specToAsyncHelmValues maps the CRD spec to upstream llm-d-async Helm values.
 func specToAsyncHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string, images ComponentImages) map[string]any {
 	ac := gw.Spec.Processor.AsyncConfig
 	if ac == nil {
@@ -58,43 +75,60 @@ func specToAsyncHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 	setIfNotEmpty(ap, "prometheusURL", ac.PrometheusURL)
 	setIfNotEmpty(ap, "prometheusCacheTTL", ac.PrometheusCacheTTL)
 
+	gatewayURL := ""
+	if ac.InferenceGateway != nil {
+		gatewayURL = ac.InferenceGateway.URL
+	}
+
 	if ac.Redis != nil {
-		redis := map[string]any{
-			"enabled":    true,
-			"secretName": secretName,
-			"secretKey":  "redis-url",
+		transportConfig := map[string]any{
+			"urlSecret": map[string]any{
+				"name": secretName,
+				"key":  "redis-url",
+			},
 		}
-		setIfNotEmpty(redis, "requestPathURL", ac.Redis.RequestPathURL)
 		if ac.Redis.PollIntervalMs != nil {
-			redis["pollIntervalMs"] = int64(*ac.Redis.PollIntervalMs)
+			transportConfig["poll_interval_ms"] = int64(*ac.Redis.PollIntervalMs)
 		}
 		if ac.Redis.BatchSize != nil {
-			redis["batchSize"] = int64(*ac.Redis.BatchSize)
+			transportConfig["batch_size"] = int64(*ac.Redis.BatchSize)
 		}
-		setIfNotEmpty(redis, "gateType", ac.Redis.GateType)
-		if len(ac.Redis.GateParams) > 0 {
-			redis["gateParams"] = toStringInterfaceMap(ac.Redis.GateParams)
+		if gw.Spec.OTEL != nil && gw.Spec.OTEL.RedisTracing {
+			transportConfig["enable_tracing"] = true
 		}
-		if len(ac.Redis.QueuesConfig) > 0 {
-			var queues []any
-			for _, q := range ac.Redis.QueuesConfig {
-				qm := map[string]any{
-					"queue_name": q.Name,
-				}
-				setIfNotEmpty(qm, "worker_pool_id", q.WorkerPoolID)
-				setIfNotEmpty(qm, "igw_base_url", q.IGWBaseURL)
-				setIfNotEmpty(qm, "request_path_url", q.RequestPathURL)
-				setIfNotEmpty(qm, "gate_type", q.GateType)
-				if len(q.GateParams) > 0 {
-					qm["gate_params"] = toStringInterfaceMap(q.GateParams)
-				}
-				queues = append(queues, qm)
-			}
-			redis["queuesConfig"] = queues
+
+		transportConfig["queues"] = asyncQueueValues(redisQueues(gw), gatewayURL)
+		ap["transport"] = asyncTransportRedis
+		ap["transportConfig"] = transportConfig
+	} else if ac.SQL != nil {
+		transportConfig := map[string]any{
+			"urlSecret": map[string]any{
+				"name": secretName,
+				"key":  "postgresql-url",
+			},
 		}
-		ap["redis"] = redis
+		if resultQueue := sqlResultQueueName(gw); resultQueue != "" {
+			transportConfig["result_queue_name"] = resultQueue
+		}
+		if ac.SQL.PollIntervalMs != nil {
+			transportConfig["poll_interval_ms"] = int64(*ac.SQL.PollIntervalMs)
+		}
+		if ac.SQL.BatchSize != nil {
+			transportConfig["batch_size"] = int64(*ac.SQL.BatchSize)
+		}
+		if ac.SQL.ResultBatchSize != nil {
+			transportConfig["result_batch_size"] = int64(*ac.SQL.ResultBatchSize)
+		}
+		if ac.SQL.LeaseTTLSeconds != nil {
+			transportConfig["lease_ttl_seconds"] = int64(*ac.SQL.LeaseTTLSeconds)
+		}
+		if ac.SQL.HandoffTimeoutSeconds != nil {
+			transportConfig["handoff_timeout_seconds"] = int64(*ac.SQL.HandoffTimeoutSeconds)
+		}
+		transportConfig["queues"] = asyncQueueValues(sqlQueues(gw), gatewayURL)
+		ap["transport"] = asyncTransportSQL
+		ap["transportConfig"] = transportConfig
 	}
-	ap["messageQueueImpl"] = "redis-sortedset" // this is the only support value here even upstream might have different options
 
 	if len(ac.WorkerPools) > 0 {
 		var pools []any
@@ -198,6 +232,117 @@ func specToAsyncHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 	}
 
 	return map[string]any{
-		"ap": ap,
+		// Preserve the resource names and Deployment selector used by the
+		// previous async-processor chart during in-place operator upgrades.
+		"nameOverride": "async-processor",
+		"ap":           ap,
 	}
+}
+
+func asyncQueueValues(queueConfigs []batchv1alpha1.AsyncQueueConfig, gatewayURL string) []any {
+	queues := make([]any, 0, len(queueConfigs))
+	for _, q := range queueConfigs {
+		qm := map[string]any{"queue_name": q.Name}
+		setIfNotEmpty(qm, "worker_pool_id", q.WorkerPoolID)
+		queueGatewayURL := q.IGWBaseURL
+		if queueGatewayURL == "" {
+			queueGatewayURL = gatewayURL
+		}
+		setIfNotEmpty(qm, "igw_base_url", queueGatewayURL)
+		setIfNotEmpty(qm, "request_path_url", q.RequestPathURL)
+		setIfNotEmpty(qm, "gate_type", q.GateType)
+		if len(q.GateParams) > 0 {
+			qm["gate_params"] = toStringInterfaceMap(q.GateParams)
+		}
+		queues = append(queues, qm)
+	}
+	return queues
+}
+
+// sortedModelNames returns the model names in a stable order.
+func sortedModelNames(gw *batchv1alpha1.LLMBatchGateway) []string {
+	return slices.Sorted(maps.Keys(gw.Spec.Processor.ModelGateways))
+}
+
+func sortedModelGateways(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.ModelGatewaySpec {
+	models := sortedModelNames(gw)
+
+	gateways := make([]batchv1alpha1.ModelGatewaySpec, 0, len(models))
+	for _, model := range models {
+		gateways = append(gateways, gw.Spec.Processor.ModelGateways[model])
+	}
+	return gateways
+}
+
+// sqlResultQueueName returns the default result queue used by the SQL dispatcher.
+// The dispatcher applies it only when a request does not carry its own result
+// routing. The Batch Gateway processor stamps every request with
+// <base>:<consumerID>, which the dispatcher honors per request, so each model
+// keeps its own result queue. The first model's queue (by sorted name) is used
+// only as the fallback.
+func sqlResultQueueNameFor(gateway batchv1alpha1.ModelGatewaySpec) string {
+	if gateway.ResultQueueName != "" {
+		return gateway.ResultQueueName
+	}
+	return asyncResultQueueName(gateway.InferencePoolName)
+}
+
+func sqlResultQueueName(gw *batchv1alpha1.LLMBatchGateway) string {
+	gateways := sortedModelGateways(gw)
+	if len(gateways) == 0 {
+		return ""
+	}
+	return sqlResultQueueNameFor(gateways[0])
+}
+
+// requestQueueNameFor returns the request queue a model publishes to.
+func requestQueueNameFor(gateway batchv1alpha1.ModelGatewaySpec) string {
+	if gateway.RequestQueueName != "" {
+		return gateway.RequestQueueName
+	}
+	return asyncRequestQueueName(gateway.InferencePoolName)
+}
+
+// redisQueues returns the Redis dispatcher queues: the configured ones, or one
+// per model gateway carrying the top-level Redis queue settings. The latter
+// matches the request queues the batch processor publishes to.
+func redisQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+	ac := gw.Spec.Processor.AsyncConfig
+	if len(ac.Redis.QueuesConfig) > 0 {
+		return ac.Redis.QueuesConfig
+	}
+	queues := defaultAsyncQueues(gw)
+	for i := range queues {
+		queues[i].RequestPathURL = ac.Redis.RequestPathURL
+		queues[i].GateType = ac.Redis.GateType
+		queues[i].GateParams = ac.Redis.GateParams
+	}
+	return queues
+}
+
+// sqlQueues returns the SQL dispatcher queues: the configured ones, or one per
+// model gateway.
+func sqlQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+	if ac := gw.Spec.Processor.AsyncConfig; len(ac.SQL.QueuesConfig) > 0 {
+		return ac.SQL.QueuesConfig
+	}
+	return defaultAsyncQueues(gw)
+}
+
+// defaultAsyncQueues derives one request queue per model gateway, deduplicated by
+// queue name. Used for both async transports when queuesConfig is omitted, and it
+// matches the names the batch processor publishes to.
+func defaultAsyncQueues(gw *batchv1alpha1.LLMBatchGateway) []batchv1alpha1.AsyncQueueConfig {
+	gateways := sortedModelGateways(gw)
+	queues := make([]batchv1alpha1.AsyncQueueConfig, 0, len(gateways))
+	seen := make(map[string]struct{}, len(gateways))
+	for _, gateway := range gateways {
+		name := requestQueueNameFor(gateway)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		queues = append(queues, batchv1alpha1.AsyncQueueConfig{Name: name})
+	}
+	return queues
 }
