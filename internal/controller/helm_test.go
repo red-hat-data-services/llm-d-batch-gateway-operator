@@ -1,11 +1,13 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
 
 	batchv1alpha1 "github.com/opendatahub-io/llm-d-batch-gateway-operator/api/v1alpha1"
@@ -13,6 +15,15 @@ import (
 )
 
 const classifyEndpoint = "/v1/classify"
+
+const (
+	// testAsyncPoolName is the inference pool used by async-mode test gateways.
+	testAsyncPoolName = "pool-a"
+	// testAsyncResultPollTimeout is the result poll timeout used by test gateways.
+	testAsyncResultPollTimeout = "30s"
+	// testAsyncObjective is the inference objective used by async test gateways.
+	testAsyncObjective = "latency"
+)
 
 // testSecretName returns the secret name for use in tests, simulating what
 // resolveSecret returns in the same-namespace case.
@@ -27,7 +38,7 @@ func testImages() ComponentImages {
 		APIServer: "ghcr.io/llm-d/batch-gateway-apiserver:latest",
 		Processor: "ghcr.io/llm-d/batch-gateway-processor:latest",
 		GC:        "ghcr.io/llm-d/batch-gateway-gc:latest",
-		Async:     "ghcr.io/llm-d-incubation/llm-d-async:v0.7.2", // TODO: sync with Makefile tag
+		Async:     "ghcr.io/llm-d/llm-d-async:v1.0.0",
 	}
 }
 
@@ -132,9 +143,11 @@ func TestSpecToHelmValues(t *testing.T) {
 			},
 			Processor: batchv1alpha1.ProcessorSpec{
 				Replicas: &replicas,
-				GlobalInferenceGateway: &batchv1alpha1.InferenceGatewaySpec{
-					URL:            "http://inference-gateway:8000",
-					RequestTimeout: "5m",
+				ModelGateways: map[string]batchv1alpha1.ModelGatewaySpec{
+					"model-a": {InferencePoolName: testAsyncPoolName},
+				},
+				AsyncConfig: &batchv1alpha1.AsyncProcessorSpec{
+					ResultPollTimeout: testAsyncResultPollTimeout,
 				},
 			},
 			GC: batchv1alpha1.GCSpec{
@@ -220,15 +233,19 @@ func TestSpecToHelmValues(t *testing.T) {
 		}
 	})
 
-	t.Run("processor inference gateway", func(t *testing.T) {
+	t.Run("processor async dispatch", func(t *testing.T) {
 		processor := vals["processor"].(map[string]interface{})
 		config := processor["config"].(map[string]interface{})
-		gig := config["globalInferenceGateway"].(map[string]interface{})
-		if got := gig["url"]; got != "http://inference-gateway:8000" {
-			t.Errorf("url = %v", got)
+		if got := config["dispatchMode"]; got != dispatchModeAsync {
+			t.Errorf("dispatchMode = %v, want %q", got, dispatchModeAsync)
 		}
-		if got := gig["requestTimeout"]; got != "5m" {
-			t.Errorf("requestTimeout = %v", got)
+		ad := config["asyncDispatch"].(map[string]interface{})
+		if got := ad["resultPollTimeout"]; got != testAsyncResultPollTimeout {
+			t.Errorf("asyncDispatch.resultPollTimeout = %v, want 30s", got)
+		}
+		model := asyncModelConfig(t, config, "model-a")
+		if got := model["inferencePoolName"]; got != testAsyncPoolName {
+			t.Errorf("asyncDispatch.models.model-a.inferencePoolName = %v, want pool-a", got)
 		}
 	})
 
@@ -424,6 +441,85 @@ func TestRenderBatchChart(t *testing.T) {
 	})
 }
 
+func TestRenderBatchChart_ResumableDefaults(t *testing.T) {
+	renderer, err := NewHelmRenderer("../../batch-gateway/charts/batch-gateway", testImages(), tlspkg.ProfileValues{})
+	if err != nil {
+		t.Fatalf("NewHelmRenderer() error: %v", err)
+	}
+
+	objects, err := renderer.RenderBatchChart(minimalGateway(), testSecretName(minimalGateway()))
+	if err != nil {
+		t.Fatalf("RenderBatchChart() error: %v", err)
+	}
+
+	for _, obj := range objects {
+		if obj.GetKind() != "ConfigMap" || !strings.Contains(obj.GetName(), "processor") {
+			continue
+		}
+		data, found, err := unstructured.NestedString(obj.Object, "data", "config.yaml")
+		if err != nil {
+			t.Fatalf("reading processor ConfigMap data: %v", err)
+		}
+		if !found {
+			t.Fatal("processor ConfigMap has no data.config.yaml")
+		}
+		if !strings.Contains(data, `finalize_timeout: "30m"`) {
+			t.Fatalf("processor ConfigMap resumable defaults = %q, want finalize_timeout 30m", data)
+		}
+		return
+	}
+
+	t.Fatal("processor ConfigMap not rendered")
+}
+
+func TestRenderBatchChart_AsyncDispatchSQLMaxConnections(t *testing.T) {
+	renderer, err := NewHelmRenderer("../../batch-gateway/charts/batch-gateway", testImages(), tlspkg.ProfileValues{})
+	if err != nil {
+		t.Fatalf("NewHelmRenderer() error: %v", err)
+	}
+
+	maxConnections := int32(1)
+	gw := minimalGateway()
+	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
+		"model-a": {
+			InferencePoolName: "pool-a",
+			RequestQueueName:  asyncRequestQueueName("pool-a"),
+			ResultQueueName:   asyncResultQueueName("pool-a"),
+		},
+	}
+	gw.Spec.Processor.AsyncConfig = &batchv1alpha1.AsyncProcessorSpec{
+		ResultPollTimeout: "45s",
+		SQL:               &batchv1alpha1.AsyncSQLSpec{MaxConnections: &maxConnections},
+	}
+
+	objects, err := renderer.RenderBatchChart(gw, testSecretName(gw))
+	if err != nil {
+		t.Fatalf("RenderBatchChart() error: %v", err)
+	}
+
+	for _, obj := range objects {
+		if obj.GetKind() != "ConfigMap" || !strings.Contains(obj.GetName(), "processor") {
+			continue
+		}
+		data, found, err := unstructured.NestedString(obj.Object, "data", "config.yaml")
+		if err != nil {
+			t.Fatalf("reading processor ConfigMap data: %v", err)
+		}
+		if !found {
+			t.Fatal("processor ConfigMap has no data.config.yaml")
+		}
+		if !strings.Contains(data, `transport: "sql"`) {
+			t.Fatalf("processor ConfigMap transport = %q, want sql", data)
+		}
+		if !strings.Contains(data, "max_connections: 1") {
+			t.Fatalf("processor ConfigMap max_connections = %q, want 1", data)
+		}
+		return
+	}
+
+	t.Fatal("processor ConfigMap not rendered")
+}
+
 func TestRenderBatchChart_WithMonitoring(t *testing.T) {
 	renderer, err := NewHelmRenderer("../../batch-gateway/charts/batch-gateway", testImages(), tlspkg.ProfileValues{})
 	if err != nil {
@@ -505,7 +601,7 @@ func TestSpecToHelmValues_FSStorage(t *testing.T) {
 		Retry: &batchv1alpha1.FileRetrySpec{
 			MaxRetries:     ptr.To(int32(5)),
 			InitialBackoff: "500ms",
-			MaxBackoff:     "30s",
+			MaxBackoff:     testDuration30s,
 		},
 	}
 
@@ -634,85 +730,53 @@ func TestSpecToHelmValues_HTTPRouteAnnotations(t *testing.T) {
 	}
 }
 
+// asyncModelConfig returns the rendered processor.config.asyncDispatch.models
+// entry for the given model, failing the test when it is missing.
+func asyncModelConfig(t *testing.T, config map[string]interface{}, model string) map[string]interface{} {
+	t.Helper()
+	ad, ok := config["asyncDispatch"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("processor.config.asyncDispatch not set")
+	}
+	models, ok := ad["models"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("processor.config.asyncDispatch.models not set")
+	}
+	m, ok := models[model].(map[string]interface{})
+	if !ok {
+		t.Fatalf("processor.config.asyncDispatch.models.%s not set", model)
+	}
+	return m
+}
+
 func TestSpecToHelmValues_ModelGateways(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway = nil
-	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
-		"model-a": {URL: "http://model-a:8000", RequestTimeout: "2m", InferenceObjective: "latency"},
+	gw.Spec.Processor.ModelGateways["model-a"] = batchv1alpha1.ModelGatewaySpec{
+		InferencePoolName:  testAsyncPoolName,
+		InferenceObjective: testAsyncObjective,
 	}
 
 	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
 
 	processor := vals["processor"].(map[string]interface{})
 	config := processor["config"].(map[string]interface{})
-	mg := config["modelGateways"].(map[string]interface{})
-	ma := mg["model-a"].(map[string]interface{})
-	if got := ma["url"]; got != "http://model-a:8000" {
-		t.Errorf("modelGateways.model-a.url = %v", got)
+	ma := asyncModelConfig(t, config, "model-a")
+	if got := ma["inferencePoolName"]; got != testAsyncPoolName {
+		t.Errorf("asyncDispatch.models.model-a.inferencePoolName = %v", got)
 	}
-	if got := ma["requestTimeout"]; got != "2m" {
-		t.Errorf("modelGateways.model-a.requestTimeout = %v", got)
+	if got := ma["inferenceObjective"]; got != testAsyncObjective {
+		t.Errorf("asyncDispatch.models.model-a.inferenceObjective = %v, want latency", got)
 	}
-	if got := ma["inferenceObjective"]; got != "latency" {
-		t.Errorf("modelGateways.model-a.inferenceObjective = %v, want latency", got)
+	if _, ok := config["modelGateways"]; ok {
+		t.Error("processor.config.modelGateways should not be rendered in async mode")
 	}
-}
-
-func TestSpecToHelmValues_SyncGatewaysOmitQueueNames(t *testing.T) {
-	// validateSpec rejects these fields outside async mode; this covers the pure mapper.
-	t.Run("globalInferenceGateway", func(t *testing.T) {
-		gw := minimalGateway()
-		gw.Spec.Processor.GlobalInferenceGateway.RequestQueueName = "requests"
-		gw.Spec.Processor.GlobalInferenceGateway.ResultQueueName = "results"
-
-		vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-
-		processor := vals["processor"].(map[string]interface{})
-		config := processor["config"].(map[string]interface{})
-		global := config["globalInferenceGateway"].(map[string]interface{})
-		if _, ok := global["requestQueueName"]; ok {
-			t.Error("globalInferenceGateway.requestQueueName should not be rendered")
-		}
-		if _, ok := global["resultQueueName"]; ok {
-			t.Error("globalInferenceGateway.resultQueueName should not be rendered")
-		}
-	})
-
-	t.Run("modelGateways", func(t *testing.T) {
-		gw := minimalGateway()
-		gw.Spec.Processor.GlobalInferenceGateway = nil
-		gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
-			"model-a": {
-				URL:              "http://model-a:8000",
-				RequestQueueName: "requests",
-				ResultQueueName:  "results",
-			},
-		}
-
-		vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-
-		processor := vals["processor"].(map[string]interface{})
-		config := processor["config"].(map[string]interface{})
-		models := config["modelGateways"].(map[string]interface{})
-		model := models["model-a"].(map[string]interface{})
-		if _, ok := model["requestQueueName"]; ok {
-			t.Error("modelGateways.model-a.requestQueueName should not be rendered")
-		}
-		if _, ok := model["resultQueueName"]; ok {
-			t.Error("modelGateways.model-a.resultQueueName should not be rendered")
-		}
-	})
 }
 
 func TestSpecToHelmValues_PerGatewayInferenceObjective(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway = &batchv1alpha1.InferenceGatewaySpec{
-		URL:                "http://global:8000",
-		InferenceObjective: "throughput",
-	}
-	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
-		"model-a": {URL: "http://model-a:8000", InferenceObjective: "latency"},
-		"model-b": {URL: "http://model-b:8000"},
+	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
+		"model-a": {InferencePoolName: testAsyncPoolName, InferenceObjective: testAsyncObjective},
+		"model-b": {InferencePoolName: "pool-b"},
 	}
 
 	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
@@ -720,76 +784,16 @@ func TestSpecToHelmValues_PerGatewayInferenceObjective(t *testing.T) {
 	processor := vals["processor"].(map[string]interface{})
 	config := processor["config"].(map[string]interface{})
 
-	gwConfig := config["globalInferenceGateway"].(map[string]interface{})
-	if got := gwConfig["inferenceObjective"]; got != "throughput" {
-		t.Errorf("globalInferenceGateway.inferenceObjective = %v, want throughput", got)
-	}
-
-	mg := config["modelGateways"].(map[string]interface{})
-	ma := mg["model-a"].(map[string]interface{})
-	if got := ma["inferenceObjective"]; got != "latency" {
+	ad := config["asyncDispatch"].(map[string]interface{})
+	models := ad["models"].(map[string]interface{})
+	ma := models["model-a"].(map[string]interface{})
+	if got := ma["inferenceObjective"]; got != testAsyncObjective {
 		t.Errorf("model-a.inferenceObjective = %v, want latency", got)
 	}
 
-	mb := mg["model-b"].(map[string]interface{})
+	mb := models["model-b"].(map[string]interface{})
 	if _, exists := mb["inferenceObjective"]; exists {
 		t.Errorf("model-b should not have inferenceObjective, got %v", mb["inferenceObjective"])
-	}
-}
-
-func TestSpecToHelmValues_LegacyInferenceObjective(t *testing.T) {
-	tests := []struct {
-		name       string
-		global     *batchv1alpha1.InferenceGatewaySpec
-		models     map[string]batchv1alpha1.InferenceGatewaySpec
-		wantGlobal string
-		wantModels map[string]string
-	}{
-		{
-			name:       "fills global gateway",
-			global:     &batchv1alpha1.InferenceGatewaySpec{URL: "http://global:8000"},
-			wantGlobal: "batch-sheddable",
-		},
-		{
-			name:       "global gateway objective wins",
-			global:     &batchv1alpha1.InferenceGatewaySpec{URL: "http://global:8000", InferenceObjective: "own"},
-			wantGlobal: "own",
-		},
-		{
-			name: "fills model gateways that have none",
-			models: map[string]batchv1alpha1.InferenceGatewaySpec{
-				"model-a": {URL: "http://model-a:8000"},
-				"model-b": {URL: "http://model-b:8000", InferenceObjective: "own"},
-			},
-			wantModels: map[string]string{"model-a": "batch-sheddable", "model-b": "own"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := minimalGateway()
-			gw.Spec.Processor.GlobalInferenceGateway = tt.global
-			gw.Spec.Processor.ModelGateways = tt.models
-			gw.Spec.Processor.Config = &batchv1alpha1.ProcessorConfigSpec{InferenceObjective: "batch-sheddable"}
-
-			vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-			config := vals["processor"].(map[string]interface{})["config"].(map[string]interface{})
-
-			if _, exists := config["inferenceObjective"]; exists {
-				t.Errorf("processor.config.inferenceObjective should not be rendered, got %v", config["inferenceObjective"])
-			}
-			if tt.global != nil {
-				gwConfig := config["globalInferenceGateway"].(map[string]interface{})
-				if got := gwConfig["inferenceObjective"]; got != tt.wantGlobal {
-					t.Errorf("globalInferenceGateway.inferenceObjective = %v, want %s", got, tt.wantGlobal)
-				}
-			}
-			for model, want := range tt.wantModels {
-				mg := config["modelGateways"].(map[string]interface{})[model].(map[string]interface{})
-				if got := mg["inferenceObjective"]; got != want {
-					t.Errorf("modelGateways.%s.inferenceObjective = %v, want %s", model, got, want)
-				}
-			}
-		})
 	}
 }
 
@@ -887,7 +891,10 @@ func TestSpecToHelmValues_APIServerConfig(t *testing.T) {
 
 func TestSpecToHelmValues_ProcessorConfig(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway.InferenceObjective = "max-throughput"
+	gw.Spec.Processor.ModelGateways["model-a"] = batchv1alpha1.ModelGatewaySpec{
+		InferencePoolName:  testAsyncPoolName,
+		InferenceObjective: "max-throughput",
+	}
 	gw.Spec.Processor.Config = &batchv1alpha1.ProcessorConfigSpec{
 		NumWorkers: 8,
 		Concurrency: &batchv1alpha1.ConcurrencyConfig{
@@ -895,10 +902,15 @@ func TestSpecToHelmValues_ProcessorConfig(t *testing.T) {
 			PerEndpoint: 16,
 			Recovery:    4,
 		},
+		Resumable: &batchv1alpha1.ResumableConfigSpec{
+			LeaseDuration:       "5m",
+			FinalizeConcurrency: 16,
+			FinalizeTimeout:     "30m",
+		},
 		InputFileDiskBudgetPercent:     20,
 		ExtraEndpoints:                 ptr.To([]string{classifyEndpoint}),
 		DefaultOutputExpirationSeconds: 7200,
-		ProgressUpdateInterval:         "30s",
+		ProgressUpdateInterval:         testDuration30s,
 		EnablePprof:                    true,
 	}
 
@@ -923,17 +935,27 @@ func TestSpecToHelmValues_ProcessorConfig(t *testing.T) {
 	if got := concurrency["recovery"]; got != int64(4) {
 		t.Errorf("concurrency.recovery = %v, want 4", got)
 	}
-	gwConfig, ok := config["globalInferenceGateway"].(map[string]interface{})
+	resumable, ok := config["resumable"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("globalInferenceGateway not found or wrong type: %T", config["globalInferenceGateway"])
+		t.Fatalf("resumable not found or wrong type: %T", config["resumable"])
 	}
-	if got := gwConfig["inferenceObjective"]; got != "max-throughput" {
-		t.Errorf("globalInferenceGateway.inferenceObjective = %v, want max-throughput", got)
+	if got := resumable["leaseDuration"]; got != "5m" {
+		t.Errorf("resumable.leaseDuration = %v, want 5m", got)
+	}
+	if got := resumable["finalizeConcurrency"]; got != int64(16) {
+		t.Errorf("resumable.finalizeConcurrency = %v, want 16", got)
+	}
+	if got := resumable["finalizeTimeout"]; got != "30m" {
+		t.Errorf("resumable.finalizeTimeout = %v, want 30m", got)
+	}
+	modelConfig := asyncModelConfig(t, config, "model-a")
+	if got := modelConfig["inferenceObjective"]; got != "max-throughput" {
+		t.Errorf("asyncDispatch.models.model-a.inferenceObjective = %v, want max-throughput", got)
 	}
 	if got := config["defaultOutputExpirationSeconds"]; got != int64(7200) {
 		t.Errorf("defaultOutputExpirationSeconds = %v, want 7200", got)
 	}
-	if got := config["progressUpdateInterval"]; got != "30s" {
+	if got := config["progressUpdateInterval"]; got != testDuration30s {
 		t.Errorf("progressUpdateInterval = %v, want 30s", got)
 	}
 	if got := config["inputFileDiskBudgetPercent"]; got != int64(20) {
@@ -1103,84 +1125,18 @@ func TestSpecToHelmValues_GCReconcilerNil(t *testing.T) {
 	}
 }
 
-func TestSpecToHelmValues_InferenceGatewayMaxRetries(t *testing.T) {
-	maxRetries := int32(3)
+func TestSpecToHelmValues_DBClientHasNoRedisSettings(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway = &batchv1alpha1.InferenceGatewaySpec{
-		URL:        "http://gw:8000",
-		MaxRetries: &maxRetries,
-	}
-
-	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-
-	processor := vals["processor"].(map[string]interface{})
-	config := processor["config"].(map[string]interface{})
-	gig := config["globalInferenceGateway"].(map[string]interface{})
-	if got := gig["maxRetries"]; got != int64(3) {
-		t.Errorf("maxRetries = %v, want 3", got)
-	}
-}
-
-func TestSpecToHelmValues_CoreRedisSettingsIgnored(t *testing.T) {
-	gw := minimalGateway()
-	gw.Spec.Redis = &batchv1alpha1.RedisClientSpec{
-		EnableTLS: true,
-		Insecure:  true,
-	}
 
 	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
 
 	global := vals["global"].(map[string]interface{})
 	dbClient := global["dbClient"].(map[string]interface{})
+	if got := dbClient["type"]; got != dbBackendPostgreSQL {
+		t.Errorf("dbClient.type = %v, want %q", got, dbBackendPostgreSQL)
+	}
 	if _, ok := dbClient["redis"]; ok {
 		t.Error("dbClient.redis must not be rendered by the current chart")
-	}
-}
-
-func TestSpecToHelmValues_InferenceGatewayDefaults(t *testing.T) {
-	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway = &batchv1alpha1.InferenceGatewaySpec{
-		URL: "http://gw:8000",
-	}
-
-	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-
-	processor := vals["processor"].(map[string]interface{})
-	config := processor["config"].(map[string]interface{})
-	gig := config["globalInferenceGateway"].(map[string]interface{})
-
-	checks := map[string]interface{}{
-		"maxRetries":     int64(3),
-		"requestTimeout": "5m",
-		"initialBackoff": "1s",
-		"maxBackoff":     "60s",
-	}
-	for key, want := range checks {
-		got, exists := gig[key]
-		if !exists {
-			t.Errorf("%s must always be present to avoid <nil>/empty rendering in Helm templates", key)
-			continue
-		}
-		if got != want {
-			t.Errorf("%s = %v, want %v when field is unset", key, got, want)
-		}
-	}
-}
-
-func TestSpecToHelmValues_OmitsTLSInsecureSkipVerify(t *testing.T) {
-	gw := minimalGateway()
-	gw.Spec.Processor.GlobalInferenceGateway = &batchv1alpha1.InferenceGatewaySpec{
-		URL:                   "https://gw:8443",
-		TLSInsecureSkipVerify: true,
-	}
-
-	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
-
-	processor := vals["processor"].(map[string]interface{})
-	config := processor["config"].(map[string]interface{})
-	gig := config["globalInferenceGateway"].(map[string]interface{})
-	if _, found := gig["tlsInsecureSkipVerify"]; found {
-		t.Fatal("tlsInsecureSkipVerify should not be rendered into Helm values")
 	}
 }
 
@@ -1329,14 +1285,12 @@ func TestSpecToHelmValues_RouteKeyMethod(t *testing.T) {
 
 func TestSpecToHelmValues_AsyncDispatchModels(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.DispatchMode = dispatchModeAsync
-	gw.Spec.Processor.GlobalInferenceGateway = nil
-	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.InferenceGatewaySpec{
+	gw.Spec.Processor.ModelGateways = map[string]batchv1alpha1.ModelGatewaySpec{
 		"model-a": {
-			InferencePoolName:  "pool-a",
+			InferencePoolName:  testAsyncPoolName,
 			InferenceObjective: "batch-a",
-			RequestQueueName:   "llm-d-async:requests:pool-a",
-			ResultQueueName:    "llm-d-async:results:pool-a",
+			RequestQueueName:   asyncRequestQueueName("pool-a"),
+			ResultQueueName:    asyncResultQueueName("pool-a"),
 		},
 	}
 	gw.Spec.Processor.AsyncConfig = &batchv1alpha1.AsyncProcessorSpec{
@@ -1356,48 +1310,75 @@ func TestSpecToHelmValues_AsyncDispatchModels(t *testing.T) {
 	}
 	models := ad["models"].(map[string]any)
 	model := models["model-a"].(map[string]any)
-	if got := model["inferencePoolName"]; got != "pool-a" {
+	if got := model["inferencePoolName"]; got != testAsyncPoolName {
 		t.Errorf("asyncDispatch.models.model-a.inferencePoolName = %v, want pool-a", got)
 	}
 	if got := model["inferenceObjective"]; got != "batch-a" {
 		t.Errorf("asyncDispatch.models.model-a.inferenceObjective = %v, want batch-a", got)
 	}
-	if got := model["requestQueueName"]; got != "llm-d-async:requests:pool-a" {
-		t.Errorf("asyncDispatch.models.model-a.requestQueueName = %v", got)
+	if got := model["requestQueueName"]; got != asyncRequestQueueName("pool-a") {
+		t.Errorf("asyncDispatch.models.model-a.requestQueueName = %v, want %s", got, asyncRequestQueueName("pool-a"))
 	}
-	if got := model["resultQueueName"]; got != "llm-d-async:results:pool-a" {
-		t.Errorf("asyncDispatch.models.model-a.resultQueueName = %v", got)
+	if got := model["resultQueueName"]; got != asyncResultQueueName("pool-a") {
+		t.Errorf("asyncDispatch.models.model-a.resultQueueName = %v, want %s", got, asyncResultQueueName("pool-a"))
 	}
 	if _, ok := config["modelGateways"]; ok {
 		t.Error("processor.config.modelGateways should not be rendered in async mode")
 	}
 }
 
-func TestSpecToHelmValues_AsyncDispatchResultPollTimeout_Unset(t *testing.T) {
-	gw := minimalGateway()
+func TestSpecToHelmValues_AsyncDispatchSQLMaxConnections(t *testing.T) {
+	one := int32(1)
+	eight := int32(8)
 
-	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
+	tests := []struct {
+		name      string
+		maxConns  *int32
+		want      any
+		wantValue bool
+	}{
+		{name: "unset uses chart default", maxConns: nil},
+		{name: "explicit one", maxConns: &one, want: int64(1), wantValue: true},
+		{name: "explicit eight", maxConns: &eight, want: int64(8), wantValue: true},
+	}
 
-	processor := vals["processor"].(map[string]interface{})
-	config := processor["config"].(map[string]interface{})
-	if _, ok := config["asyncDispatch"]; ok {
-		t.Error("processor.config.asyncDispatch should not be set when resultPollTimeout is empty")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := minimalGateway()
+			g.Spec.Processor.AsyncConfig = &batchv1alpha1.AsyncProcessorSpec{
+				ResultPollTimeout: "45s",
+				SQL:               &batchv1alpha1.AsyncSQLSpec{MaxConnections: tt.maxConns},
+			}
+
+			vals := specToBatchHelmValues(g, testSecretName(g), testImages(), tlspkg.ProfileValues{})
+			processor := vals["processor"].(map[string]interface{})
+			config := processor["config"].(map[string]interface{})
+			asyncDispatch := config["asyncDispatch"].(map[string]any)
+
+			got, ok := asyncDispatch["maxConnections"]
+			if ok != tt.wantValue {
+				t.Fatalf("asyncDispatch.maxConnections presence = %v, want %v", ok, tt.wantValue)
+			}
+			if tt.wantValue && got != tt.want {
+				t.Errorf("asyncDispatch.maxConnections = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestSpecToHelmValues_AsyncConfigIgnoredInSyncMode(t *testing.T) {
+func TestSpecToHelmValues_AsyncDispatchNilAsyncConfig(t *testing.T) {
 	gw := minimalGateway()
-	gw.Spec.Processor.DispatchMode = "sync"
-	gw.Spec.Processor.AsyncConfig = &batchv1alpha1.AsyncProcessorSpec{
-		ResultPollTimeout: "45s",
-	}
+	gw.Spec.Processor.AsyncConfig = nil
 
 	vals := specToBatchHelmValues(gw, testSecretName(gw), testImages(), tlspkg.ProfileValues{})
 
 	processor := vals["processor"].(map[string]interface{})
 	config := processor["config"].(map[string]interface{})
+	if got := config["dispatchMode"]; got != dispatchModeAsync {
+		t.Errorf("dispatchMode = %v, want %q even without asyncConfig", got, dispatchModeAsync)
+	}
 	if _, ok := config["asyncDispatch"]; ok {
-		t.Error("processor.config.asyncDispatch should not be set in sync mode")
+		t.Error("processor.config.asyncDispatch should not be set when asyncConfig is nil")
 	}
 }
 
@@ -1425,8 +1406,11 @@ func minimalGateway() *batchv1alpha1.LLMBatchGateway {
 			},
 			Processor: batchv1alpha1.ProcessorSpec{
 				Replicas: &replicas,
-				GlobalInferenceGateway: &batchv1alpha1.InferenceGatewaySpec{
-					URL: "http://inference-gateway:8000",
+				ModelGateways: map[string]batchv1alpha1.ModelGatewaySpec{
+					"model-a": {InferencePoolName: testAsyncPoolName},
+				},
+				AsyncConfig: &batchv1alpha1.AsyncProcessorSpec{
+					ResultPollTimeout: testAsyncResultPollTimeout,
 				},
 			},
 			GC: batchv1alpha1.GCSpec{
