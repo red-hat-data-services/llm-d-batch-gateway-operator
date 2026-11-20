@@ -465,6 +465,7 @@ type ProcessorConfigSpec struct {
 
 	// ProgressTTLSeconds is retained for API compatibility. The upstream
 	// processor now writes progress to PostgreSQL and does not use this field.
+	//
 	// Deprecated: use progressUpdateInterval.
 	ProgressTTLSeconds int64 `json:"progressTTLSeconds,omitempty"`
 
@@ -482,6 +483,14 @@ type ProcessorConfigSpec struct {
 	// Empty uses the model ID. "tenant" uses "<tenantID>/<modelID>".
 	// +kubebuilder:validation:Enum="";tenant
 	RouteKeyMethod string `json:"routeKeyMethod,omitempty"`
+
+	// TenantMetadataKey, when set, makes the processor store the job's tenant
+	// ID under this key in async request metadata, so quota gates
+	// (redis-quota, sql-quota) can tell tenants apart. Use "userid" to match
+	// their default attribute. Empty omits it.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:XValidation:rule="self.lowerAscii() != 'traceparent' && self.lowerAscii() != 'tracestate'",message="tenantMetadataKey must not be traceparent or tracestate"
+	TenantMetadataKey string `json:"tenantMetadataKey,omitempty"`
 
 	// EnablePprof enables the Go pprof profiling HTTP endpoints.
 	EnablePprof bool `json:"enablePprof,omitempty"`
