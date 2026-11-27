@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -9,10 +11,14 @@ import (
 )
 
 func (h *HelmRenderer) RenderBatchChart(gw *batchv1alpha1.LLMBatchGateway, secretName string) ([]*unstructured.Unstructured, error) {
-	return h.renderChart(gw, specToBatchHelmValues(gw, secretName, h.images, h.tlsProfile), nil)
+	values, err := specToBatchHelmValues(gw, secretName, h.images, h.tlsProfile)
+	if err != nil {
+		return nil, fmt.Errorf("building batch-gateway chart values: %w", err)
+	}
+	return h.renderChart(gw, values, nil)
 }
 
-func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string, images ComponentImages, tlsProfile tlspkg.ProfileValues) map[string]any {
+func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string, images ComponentImages, tlsProfile tlspkg.ProfileValues) (map[string]any, error) {
 	vals := map[string]any{}
 
 	// --- Global ---
@@ -22,6 +28,13 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 	}
 	dbClient := map[string]any{
 		"type": dbType,
+	}
+	if dbClientSpec := gw.Spec.DBClient; dbClientSpec != nil && dbClientSpec.PostgreSQL != nil && dbClientSpec.PostgreSQL.Pool != nil && dbClientSpec.PostgreSQL.Pool.MaxConnections != nil {
+		dbClient["postgresql"] = map[string]any{
+			"pool": map[string]any{
+				"maxConnections": int64(*dbClientSpec.PostgreSQL.Pool.MaxConnections),
+			},
+		}
 	}
 	global := map[string]any{
 		"secretName": secretName,
@@ -52,6 +65,22 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 				s3Vals["autoCreateBucket"] = *s3.AutoCreateBucket
 			}
 			fc["s3"] = s3Vals
+		}
+		if gw.Spec.FileStorage.GCS != nil {
+			fc["type"] = fileStorageTypeGCS
+			gcs := gw.Spec.FileStorage.GCS
+			gcsVals := map[string]any{
+				"bucket": gcs.Bucket,
+				"prefix": gcs.Prefix,
+			}
+			if gcs.AutoCreateBucket != nil {
+				gcsVals["autoCreateBucket"] = *gcs.AutoCreateBucket
+			}
+			if gcs.VerifyBucketOnStart != nil {
+				gcsVals["verifyBucketOnStart"] = *gcs.VerifyBucketOnStart
+			}
+			setIfNotEmpty(gcsVals, "projectId", gcs.ProjectID)
+			fc["gcs"] = gcsVals
 		}
 		if gw.Spec.FileStorage.FS != nil {
 			fc["type"] = "fs"
@@ -88,7 +117,7 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 	}
 
 	if len(gw.Spec.ImagePullSecrets) > 0 {
-		var secrets []any
+		secrets := make([]any, 0, len(gw.Spec.ImagePullSecrets))
 		for _, s := range gw.Spec.ImagePullSecrets {
 			secrets = append(secrets, map[string]any{"name": s.Name})
 		}
@@ -119,13 +148,25 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 	if gw.Spec.APIServer.Resources != nil {
 		apiserver["resources"] = resourceRequirementsToMap(gw.Spec.APIServer.Resources)
 	}
+	apiserverConfig := map[string]any{}
 	if gw.Spec.APIServer.Config != nil {
-		apiserver["config"] = apiServerConfigToMap(gw.Spec.APIServer.Config)
+		apiserverConfig = apiServerConfigToMap(gw.Spec.APIServer.Config)
 		if gw.Spec.APIServer.Config.Logging != nil && gw.Spec.APIServer.Config.Logging.Verbosity != 0 {
 			apiserver["logging"] = map[string]any{
 				"verbosity": int64(gw.Spec.APIServer.Config.Logging.Verbosity),
 			}
 		}
+	}
+	// Always render this value: the chart defaults it to false and requires a
+	// proxy token unless anonymous tenant access is enabled.
+	apiserverConfig["allowAnonymousTenant"] = allowAnonymousTenant(gw.Spec.APIServer.Config)
+	apiserver["config"] = apiserverConfig
+	if gw.Spec.APIServer.NetworkPolicy != nil {
+		networkPolicy, err := apiServerNetworkPolicyToMap(gw.Spec.APIServer.NetworkPolicy)
+		if err != nil {
+			return nil, fmt.Errorf("converting API server NetworkPolicy: %w", err)
+		}
+		apiserver["networkPolicy"] = networkPolicy
 	}
 
 	// TLS
@@ -163,7 +204,7 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 			hr["annotations"] = toStringInterfaceMap(gw.Spec.HTTPRoute.Annotations)
 		}
 		if len(gw.Spec.HTTPRoute.ParentRefs) > 0 {
-			var refs []any
+			refs := make([]any, 0, len(gw.Spec.HTTPRoute.ParentRefs))
 			for _, ref := range gw.Spec.HTTPRoute.ParentRefs {
 				r := map[string]any{
 					"name": ref.Name,
@@ -346,7 +387,7 @@ func specToBatchHelmValues(gw *batchv1alpha1.LLMBatchGateway, secretName string,
 		vals["prometheusRule"] = pr
 	}
 
-	return vals
+	return vals, nil
 }
 
 func asyncModelGatewayToMap(gw *batchv1alpha1.ModelGatewaySpec) map[string]interface{} {
@@ -411,6 +452,41 @@ func apiServerConfigToMap(cfg *batchv1alpha1.APIServerConfigSpec) map[string]int
 	return m
 }
 
+// allowAnonymousTenant returns the requested value, defaulting to true when unset.
+func allowAnonymousTenant(cfg *batchv1alpha1.APIServerConfigSpec) bool {
+	if cfg == nil || cfg.AllowAnonymousTenant == nil {
+		return true
+	}
+	return *cfg.AllowAnonymousTenant
+}
+
+func apiServerNetworkPolicyToMap(cfg *batchv1alpha1.APIServerNetworkPolicySpec) (map[string]interface{}, error) {
+	networkPolicy := map[string]interface{}{
+		"enabled": cfg.Enabled,
+		"api": map[string]interface{}{
+			"from": []interface{}{},
+		},
+		"observability": map[string]interface{}{
+			"from": []interface{}{},
+		},
+	}
+	if cfg.API != nil {
+		peers, err := networkPolicyPeersToHelmValues(cfg.API.From)
+		if err != nil {
+			return nil, fmt.Errorf("converting api.from peers: %w", err)
+		}
+		networkPolicy["api"].(map[string]interface{})["from"] = peers
+	}
+	if cfg.Observability != nil {
+		peers, err := networkPolicyPeersToHelmValues(cfg.Observability.From)
+		if err != nil {
+			return nil, fmt.Errorf("converting observability.from peers: %w", err)
+		}
+		networkPolicy["observability"].(map[string]interface{})["from"] = peers
+	}
+	return networkPolicy, nil
+}
+
 func mergeProcessorConfig(m map[string]interface{}, cfg *batchv1alpha1.ProcessorConfigSpec) {
 	if cfg.NumWorkers != 0 {
 		m["numWorkers"] = int64(cfg.NumWorkers)
@@ -473,6 +549,7 @@ func mergeProcessorConfig(m map[string]interface{}, cfg *batchv1alpha1.Processor
 		m["sendFairnessHeader"] = *cfg.SendFairnessHeader
 	}
 	setIfNotEmpty(m, "routeKeyMethod", cfg.RouteKeyMethod)
+	setIfNotEmpty(m, "tenantMetadataKey", cfg.TenantMetadataKey)
 	if cfg.EnablePprof {
 		m["enablePprof"] = true
 	}

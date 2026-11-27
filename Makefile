@@ -13,7 +13,7 @@ KIND_CLUSTER_NAME ?= batch-gateway-dev
 ## The full batch-gateway repo is checked out in $(BATCH_GATEWAY_DIR); the operator uses its chart + e2e tests.
 ## This replaces the old git submodule solution.
 BATCH_GATEWAY_REPO ?= https://github.com/opendatahub-io/batch-gateway.git
-BATCH_GATEWAY_REF  ?= 0947400279d3dbdf892497c8435c4242c0386bf8
+BATCH_GATEWAY_REF  ?= 2289116f5c582059625a0f86ae6627051b17c542
 BATCH_GATEWAY_DIR  ?= batch-gateway
 
 ## Only the llm-d-async chart is sparse-checked-out from llm-d-async.
@@ -35,7 +35,7 @@ build:
 
 ## Lint & Format
 
-GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 .PHONY: fmt
 fmt:
