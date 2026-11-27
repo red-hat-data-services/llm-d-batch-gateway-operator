@@ -1,5 +1,5 @@
 # UBI 10 — RHEL 10 has PQC crypto by default (no ubi-minimal-pqc / crypto-policies step).
-FROM registry.access.redhat.com/ubi10/go-toolset@sha256:e94c38ff4a099b755af60c73ac87198c613f369eb7f818d45c96fbc3f21047de AS builder
+FROM registry.access.redhat.com/ubi10/go-toolset@sha256:1b1b6d0a428218c617c43629240c42954beff44c48d47fe2ed25f1dfdc9dfa54 AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG CGO_ENABLED=1
